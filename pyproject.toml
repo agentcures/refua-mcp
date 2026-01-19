@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "refua-mcp"
+version = "0.0.1"
+description = "MCP server for Refua Boltz2 folding/affinity and BoltzGen design workflows."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "JJ Ben-Joseph", email = "jj@tensorspace.ai"}]
+requires-python = ">=3.11,<3.14"
+keywords = [
+    "drug discovery",
+    "machine learning",
+    "protein design",
+    "structure prediction",
+    "generative design",
+    "mcp",
+    "AI agent"
+]
+dependencies = [
+  "mcp>=1.8.0",
+  "refua",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+[project.urls]
+Homepage = "https://tensorspace.ai/"
+Repository = "https://github.com/tensorspace-ai/refua-mcp"
+
+[project.optional-dependencies]
+test = [
+  "pytest>=7.0",
+]
+dev = [
+  "pre-commit>=4.1",
+]
+
+[project.scripts]
+refua-mcp = "refua_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.data-files]
+"share/refua-mcp" = ["mcp.json"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
