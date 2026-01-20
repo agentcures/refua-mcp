@@ -56,6 +56,7 @@ codex mcp list
 - `boltz2_job`: check status for background Boltz2 jobs and optionally return results.
 - `boltzgen_antibody_design`: build BoltzGen antibody design features.
 - `boltzgen_peptide_design`: build BoltzGen peptide binder design features.
+- `small_molecule_properties`: compute small-molecule properties from SMILES strings.
 
 ## Long-Running Jobs
 

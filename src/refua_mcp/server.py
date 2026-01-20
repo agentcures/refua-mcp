@@ -14,10 +14,17 @@ from typing import Any, Callable, Iterable
 
 import numpy as np
 import torch
-from refua.boltz.data.write.mmcif import to_mmcif
 from mcp.server.fastmcp import FastMCP
-from refua import Boltz2, BoltzGen
+from refua import (
+    Boltz2,
+    BoltzGen,
+    SM,
+    available_mol_properties,
+    available_mol_property_groups,
+)
 from refua.boltz.api import bcif_bytes_from_mmcif, msa_from_a3m
+from refua.boltz.data.write.mmcif import to_mmcif
+from refua.chem import _normalize_name, mol_property_specs
 
 mcp = FastMCP("refua-mcp")
 
@@ -120,6 +127,56 @@ def _resolve_feature_output_format(output_path: str, output_format: str | None) 
     if suffix == ".npz":
         return "npz"
     return "torch"
+
+
+def _coerce_str_list(value: Any, *, field: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    raise ValueError(f"{field} must be a string or list of strings.")
+
+
+def _resolve_property_names(
+    properties: Iterable[Any] | None,
+    groups: Iterable[Any] | None,
+) -> list[str] | None:
+    prop_list = _coerce_str_list(properties, field="properties")
+    group_list = _coerce_str_list(groups, field="groups")
+    if not prop_list and not group_list:
+        return None
+
+    available_props = set(available_mol_properties())
+    available_groups = set(available_mol_property_groups())
+    resolved: list[str] = []
+
+    if group_list:
+        specs = mol_property_specs()
+        for group in group_list:
+            key = group.strip().lower()
+            if key not in available_groups:
+                raise ValueError(
+                    f"Unknown property group: {group}. Available groups: "
+                    f"{sorted(available_groups)}"
+                )
+            for name, spec in specs.items():
+                if key in spec.groups and name not in resolved:
+                    resolved.append(name)
+
+    if prop_list:
+        for prop in prop_list:
+            normalized = _normalize_name(prop)
+            if normalized not in available_props:
+                raise ValueError(
+                    f"Unknown property: {prop}. Use refua.available_mol_properties() "
+                    "for valid names."
+                )
+            if normalized not in resolved:
+                resolved.append(normalized)
+
+    return resolved
 
 
 def _build_fold_complex(
@@ -722,6 +779,37 @@ def boltzgen_peptide_design(
         "output_path": output_written,
         "output_format": feature_format,
     }
+
+
+@mcp.tool()
+def small_molecule_properties(
+    smiles: str | list[str],
+    *,
+    properties: list[str] | None = None,
+    groups: list[str] | None = None,
+    sanitize: bool = True,
+    lazy: bool = True,
+) -> dict[str, Any]:
+    """Compute small-molecule properties for SMILES strings.
+
+    If properties or groups are provided, only those properties are returned.
+    Otherwise all registered properties are computed.
+    """
+    smiles_list = _coerce_str_list(smiles, field="smiles")
+    if not smiles_list:
+        raise ValueError("smiles must include at least one string.")
+
+    property_names = _resolve_property_names(properties, groups)
+    results: list[dict[str, Any]] = []
+    for item in smiles_list:
+        props = SM(item, lazy=lazy, sanitize=sanitize)
+        if property_names is None:
+            values = props.to_dict()
+        else:
+            values = {name: props.get(name) for name in property_names}
+        results.append({"smiles": item, "properties": values})
+
+    return {"results": results}
 
 
 def main() -> None:
