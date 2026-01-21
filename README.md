@@ -1,6 +1,6 @@
 # Refua MCP Server
 
-MCP server exposing Refua Boltz2 folding/affinity and BoltzGen antibody/peptide design helpers.
+MCP server exposing Refua's unified Complex API for Boltz2 folding/affinity and BoltzGen design workflows.
 
 ## Install
 
@@ -15,8 +15,8 @@ Boltz2 and BoltzGen require model/molecule assets. If you don't have them, refua
 python -c "from refua import download_assets; download_assets()"
 ```
 
-- Boltz2: uses `~/.boltz` by default. Override via tool `cache_dir` if needed.
-- BoltzGen: uses the bundled HF artifact by default. Override via tool `mol_dir` if needed.
+- Boltz2: uses `~/.boltz` by default. Override via tool `boltz.cache_dir` if needed.
+- BoltzGen: uses the bundled HF artifact by default. Override via tool `boltzgen.mol_dir` if needed.
 
 ## MCP Clients
 
@@ -51,12 +51,29 @@ codex mcp list
 
 ## Tools
 
-- `boltz2_fold_complex`: fold a complex and return a structure in mmCIF/BCIF (set `async_mode=true` to enqueue).
-- `boltz2_affinity`: predict affinity for a ligand binder (set `async_mode=true` to enqueue).
-- `boltz2_job`: check status for background Boltz2 jobs and optionally return results.
-- `boltzgen_antibody_design`: build BoltzGen antibody design features.
-- `boltzgen_peptide_design`: build BoltzGen peptide binder design features.
-- `small_molecule_properties`: compute small-molecule properties from SMILES strings.
+- `refua_complex`: run a unified Complex spec with `action="fold"` (default) or `action="affinity"`.
+- `refua_job`: check status for background jobs and optionally return results.
+
+Example (fold a protein + ligand with optional affinity):
+
+```json
+{
+  "tool": "refua_complex",
+  "args": {
+    "name": "protein_ligand",
+    "entities": [
+      {"type": "protein", "id": "A", "sequence": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ"},
+      {"type": "ligand", "id": "lig", "smiles": "CCO"}
+    ],
+    "constraints": [
+      {"type": "pocket", "binder": "lig", "contacts": [["A", 5], ["A", 8]]}
+    ],
+    "affinity": {"binder": "lig"}
+  }
+}
+```
+
+Note: DNA/RNA entities are supported for Boltz2 folding only (BoltzGen does not accept DNA/RNA entities).
 
 ## Long-Running Jobs
 
@@ -64,10 +81,10 @@ For runs that exceed the tool-call timeout, set `async_mode=true` and poll the j
 
 ```json
 {
-  "tool": "boltz2_affinity",
+  "tool": "refua_complex",
   "args": {
     "async_mode": true,
-    "chains": [...]
+    "entities": [...]
   }
 }
 ```
@@ -76,7 +93,7 @@ Then poll with:
 
 ```json
 {
-  "tool": "boltz2_job",
+  "tool": "refua_job",
   "args": {
     "job_id": "..."
   }

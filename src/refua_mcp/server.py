@@ -10,21 +10,14 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 import torch
 from mcp.server.fastmcp import FastMCP
-from refua import (
-    Boltz2,
-    BoltzGen,
-    SM,
-    available_mol_properties,
-    available_mol_property_groups,
-)
-from refua.boltz.api import bcif_bytes_from_mmcif, msa_from_a3m
-from refua.boltz.data.write.mmcif import to_mmcif
-from refua.chem import _normalize_name, mol_property_specs
+from refua import Binder, Boltz2, BoltzGen, Complex, DNA, Protein, RNA, SmallMolecule
+from refua.boltz.api import msa_from_a3m
+from refua.boltz.data.mol import load_molecules
 
 mcp = FastMCP("refua-mcp")
 
@@ -86,6 +79,72 @@ def _get_boltzgen(
     )
 
 
+def _parse_boltz_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
+    opts = dict(options or {})
+    known = {
+        "cache_dir",
+        "device",
+        "auto_download",
+        "use_kernels",
+        "affinity_mw_correction",
+        "predict_args",
+        "affinity_predict_args",
+    }
+    unknown = set(opts) - known
+    if unknown:
+        raise ValueError(f"Unknown boltz options: {sorted(unknown)}")
+    return opts
+
+
+def _parse_boltzgen_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
+    opts = dict(options or {})
+    known = {"mol_dir", "auto_download", "cache_dir", "token", "force_download"}
+    unknown = set(opts) - known
+    if unknown:
+        raise ValueError(f"Unknown boltzgen options: {sorted(unknown)}")
+    return opts
+
+
+def _build_boltz2_from_options(options: Mapping[str, Any] | None) -> Boltz2:
+    opts = _parse_boltz_options(options)
+    cache_dir = opts.get("cache_dir", DEFAULT_BOLTZ_CACHE)
+    device = opts.get("device")
+    auto_download = bool(opts.get("auto_download", True))
+    use_kernels = bool(opts.get("use_kernels", True))
+    affinity_mw_correction = bool(opts.get("affinity_mw_correction", True))
+    predict_args = opts.get("predict_args")
+    affinity_predict_args = opts.get("affinity_predict_args")
+
+    if predict_args is not None or affinity_predict_args is not None:
+        return Boltz2(
+            cache_dir=cache_dir,
+            device=device,
+            auto_download=auto_download,
+            use_kernels=use_kernels,
+            affinity_mw_correction=affinity_mw_correction,
+            predict_args=predict_args,
+            affinity_predict_args=affinity_predict_args,
+        )
+
+    return _get_boltz2(
+        cache_dir,
+        device,
+        auto_download,
+        use_kernels,
+        affinity_mw_correction,
+    )
+
+
+def _build_boltzgen_from_options(options: Mapping[str, Any] | None) -> BoltzGen:
+    opts = _parse_boltzgen_options(options)
+    mol_dir = opts.get("mol_dir")
+    auto_download = bool(opts.get("auto_download", True))
+    cache_dir = opts.get("cache_dir")
+    token = opts.get("token")
+    force_download = bool(opts.get("force_download", False))
+    return _get_boltzgen(mol_dir, auto_download, cache_dir, token, force_download)
+
+
 def _coerce_modifications(mods: Iterable[Any]) -> list[tuple[int, str]]:
     result: list[tuple[int, str]] = []
     for mod in mods:
@@ -96,8 +155,299 @@ def _coerce_modifications(mods: Iterable[Any]) -> list[tuple[int, str]]:
         elif isinstance(mod, (list, tuple)) and len(mod) == 2:
             result.append((int(mod[0]), str(mod[1])))
         else:
-            raise ValueError("Modification entries must be dicts or (position, ccd) tuples.")
+            raise ValueError(
+                "Modification entries must be dicts or (position, ccd) tuples."
+            )
     return result
+
+
+def _coerce_chain_ids(value: Any | None) -> str | tuple[str, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError("Chain ids cannot be empty.")
+        return tuple(str(item) for item in value)
+    raise ValueError("Chain id must be a string or list of strings.")
+
+
+def _resolve_entity_ids(entity: Mapping[str, Any]) -> str | tuple[str, ...] | None:
+    if "id" in entity:
+        return _coerce_chain_ids(entity.get("id"))
+    if "ids" in entity:
+        return _coerce_chain_ids(entity.get("ids"))
+    return None
+
+
+def _resolve_msa(entity: Mapping[str, Any]) -> object | None:
+    msa_a3m = entity.get("msa_a3m")
+    if not msa_a3m:
+        return None
+    return msa_from_a3m(
+        str(msa_a3m),
+        taxonomy=entity.get("msa_taxonomy"),
+        max_seqs=entity.get("msa_max_seqs"),
+    )
+
+
+@lru_cache(maxsize=128)
+def _load_ccd_mol(mol_dir: str, ccd: str) -> Any:
+    return load_molecules(mol_dir, [ccd])[ccd]
+
+
+def _resolve_boltz_mol_dir(
+    boltz_model: Boltz2 | None,
+    boltz_options: Mapping[str, Any],
+) -> Path | None:
+    if boltz_model is not None:
+        return Path(boltz_model.mol_dir)
+    cache_dir = boltz_options.get("cache_dir") or DEFAULT_BOLTZ_CACHE
+    return Path(cache_dir).expanduser() / "mols"
+
+
+def _make_ligand(
+    *,
+    smiles: str | None,
+    ccd: str | None,
+    mol_dir: Path | None,
+) -> SmallMolecule:
+    if (smiles is None) == (ccd is None):
+        raise ValueError("Ligands require exactly one of smiles or ccd.")
+    if smiles is not None:
+        return SmallMolecule.from_smiles(str(smiles))
+    if mol_dir is None:
+        raise ValueError("CCD ligands require boltz mol_dir assets.")
+    mol = _load_ccd_mol(str(mol_dir), str(ccd))
+    return SmallMolecule.from_mol(mol, name=str(ccd))
+
+
+def _build_complex_from_spec(
+    *,
+    name: str,
+    base_dir: str | None,
+    entities: list[dict[str, Any]],
+    boltz_mol_dir: Path | None,
+) -> tuple[Complex, dict[str, str], bool, bool]:
+    if not entities:
+        raise ValueError("entities must include at least one entity spec.")
+
+    complex_spec = Complex(name=name, base_dir=base_dir)
+    ligand_alias_map: dict[str, str] = {}
+    ligand_index = 1
+    has_boltz = False
+    has_boltzgen = False
+
+    for entity in entities:
+        if not isinstance(entity, dict):
+            raise ValueError("Each entity must be a dict.")
+        entity_type = str(entity.get("type", "")).lower()
+        if not entity_type:
+            raise ValueError("Entity is missing type.")
+
+        if entity_type == "protein":
+            sequence = entity.get("sequence")
+            if not sequence:
+                raise ValueError("Protein entities require a sequence.")
+            ids = _resolve_entity_ids(entity)
+            complex_spec.add(
+                Protein(
+                    str(sequence),
+                    ids=ids,
+                    modifications=_coerce_modifications(entity.get("modifications", [])),
+                    msa=_resolve_msa(entity),
+                    binding_types=entity.get("binding_types"),
+                    secondary_structure=entity.get("secondary_structure"),
+                    cyclic=bool(entity.get("cyclic", False)),
+                )
+            )
+            has_boltz = True
+            continue
+
+        if entity_type == "dna":
+            sequence = entity.get("sequence")
+            if not sequence:
+                raise ValueError("DNA entities require a sequence.")
+            ids = _resolve_entity_ids(entity)
+            complex_spec.add(
+                DNA(
+                    str(sequence),
+                    ids=ids,
+                    modifications=_coerce_modifications(entity.get("modifications", [])),
+                    cyclic=bool(entity.get("cyclic", False)),
+                )
+            )
+            has_boltz = True
+            continue
+
+        if entity_type == "rna":
+            sequence = entity.get("sequence")
+            if not sequence:
+                raise ValueError("RNA entities require a sequence.")
+            ids = _resolve_entity_ids(entity)
+            complex_spec.add(
+                RNA(
+                    str(sequence),
+                    ids=ids,
+                    modifications=_coerce_modifications(entity.get("modifications", [])),
+                    cyclic=bool(entity.get("cyclic", False)),
+                )
+            )
+            has_boltz = True
+            continue
+
+        if entity_type == "binder":
+            ids = _resolve_entity_ids(entity)
+            spec = entity.get("spec")
+            length = entity.get("length")
+            if spec is None and length is None:
+                spec = entity.get("sequence")
+            if length is not None:
+                length = int(length)
+            complex_spec.add(
+                Binder(
+                    spec=spec,
+                    length=length,
+                    ids=ids,
+                    binding_types=entity.get("binding_types"),
+                    secondary_structure=entity.get("secondary_structure"),
+                    cyclic=bool(entity.get("cyclic", False)),
+                )
+            )
+            has_boltzgen = True
+            continue
+
+        if entity_type == "ligand":
+            ligand = _make_ligand(
+                smiles=entity.get("smiles"),
+                ccd=entity.get("ccd"),
+                mol_dir=boltz_mol_dir,
+            )
+            complex_spec.add(ligand)
+            alias_value = entity.get("id", entity.get("ids"))
+            if alias_value is not None:
+                if isinstance(alias_value, (list, tuple)):
+                    if len(alias_value) != 1:
+                        raise ValueError("Ligand id must be a single string.")
+                    alias = str(alias_value[0])
+                else:
+                    alias = str(alias_value)
+                expected = f"L{ligand_index}"
+                if alias.startswith("L") and alias[1:].isdigit() and alias != expected:
+                    raise ValueError(
+                        "Ligand id aliases cannot shadow unified ids. "
+                        "Omit the alias or use a non-L name."
+                    )
+                if alias in ligand_alias_map:
+                    raise ValueError(f"Duplicate ligand alias: {alias}")
+                ligand_alias_map[alias] = expected
+            ligand_index += 1
+            has_boltz = True
+            continue
+
+        if entity_type == "file":
+            path_value = entity.get("path")
+            if not path_value:
+                raise ValueError("File entities require a path.")
+            file_path = Path(path_value).expanduser().resolve()
+            if not file_path.exists():
+                raise FileNotFoundError(f"File not found: {file_path}")
+            complex_spec.file(
+                file_path,
+                include=entity.get("include"),
+                exclude=entity.get("exclude"),
+                include_proximity=entity.get("include_proximity"),
+                binding_types=entity.get("binding_types"),
+                structure_groups=entity.get("structure_groups"),
+                design=entity.get("design"),
+                not_design=entity.get("not_design"),
+                secondary_structure=entity.get("secondary_structure"),
+                design_insertions=entity.get("design_insertions"),
+                fuse=entity.get("fuse"),
+                msa=entity.get("msa"),
+                use_assembly=entity.get("use_assembly"),
+                reset_res_index=entity.get("reset_res_index"),
+                extra=entity.get("extra") or {},
+            )
+            has_boltzgen = True
+            continue
+
+        raise ValueError(f"Unknown entity type: {entity_type}")
+
+    return complex_spec, ligand_alias_map, has_boltz, has_boltzgen
+
+
+def _map_chain_id(value: Any, alias_map: Mapping[str, str]) -> str:
+    return alias_map.get(str(value), str(value))
+
+
+def _map_atom_ref(value: Any, alias_map: Mapping[str, str]) -> tuple[Any, Any, Any]:
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        chain, residue, atom = value
+        return (_map_chain_id(chain, alias_map), residue, atom)
+    raise ValueError("Bond atom references must be 3-item sequences.")
+
+
+def _map_token_ref(value: Any, alias_map: Mapping[str, str]) -> tuple[Any, Any]:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        chain, token = value
+        return (_map_chain_id(chain, alias_map), token)
+    raise ValueError("Token references must be 2-item sequences.")
+
+
+def _apply_constraints(
+    complex_spec: Complex,
+    constraints: list[dict[str, Any]] | None,
+    alias_map: Mapping[str, str],
+) -> None:
+    for constraint in constraints or []:
+        constraint_type = str(constraint.get("type", "")).lower()
+        if constraint_type == "bond":
+            complex_spec.bond(
+                _map_atom_ref(constraint["atom1"], alias_map),
+                _map_atom_ref(constraint["atom2"], alias_map),
+            )
+            continue
+        if constraint_type == "pocket":
+            binder = constraint.get("binder")
+            if binder is None:
+                raise ValueError("Pocket constraints require a binder.")
+            contacts = constraint.get("contacts")
+            if not contacts:
+                raise ValueError("Pocket constraints require contacts.")
+            complex_spec.pocket(
+                _map_chain_id(binder, alias_map),
+                contacts=[_map_token_ref(contact, alias_map) for contact in contacts],
+                max_distance=float(constraint.get("max_distance", 6.0)),
+                force=bool(constraint.get("force", False)),
+            )
+            continue
+        if constraint_type == "contact":
+            complex_spec.contact(
+                _map_token_ref(constraint["token1"], alias_map),
+                _map_token_ref(constraint["token2"], alias_map),
+                max_distance=float(constraint.get("max_distance", 6.0)),
+                force=bool(constraint.get("force", False)),
+            )
+            continue
+        raise ValueError(f"Unknown constraint type: {constraint_type}")
+
+
+def _resolve_affinity_request(
+    affinity: Any,
+    alias_map: Mapping[str, str],
+) -> tuple[bool, str | None]:
+    if affinity is None or affinity is False:
+        return False, None
+    if affinity is True:
+        return True, None
+    if isinstance(affinity, dict):
+        binder = affinity.get("binder")
+        if binder is None:
+            return True, None
+        return True, _map_chain_id(binder, alias_map)
+    raise ValueError("affinity must be a bool or dict with optional binder.")
 
 
 def _resolve_output_format(output_path: str | None, output_format: str | None) -> str | None:
@@ -127,149 +477,6 @@ def _resolve_feature_output_format(output_path: str, output_format: str | None) 
     if suffix == ".npz":
         return "npz"
     return "torch"
-
-
-def _coerce_str_list(value: Any, *, field: str) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, (list, tuple)):
-        return [str(item) for item in value]
-    raise ValueError(f"{field} must be a string or list of strings.")
-
-
-def _resolve_property_names(
-    properties: Iterable[Any] | None,
-    groups: Iterable[Any] | None,
-) -> list[str] | None:
-    prop_list = _coerce_str_list(properties, field="properties")
-    group_list = _coerce_str_list(groups, field="groups")
-    if not prop_list and not group_list:
-        return None
-
-    available_props = set(available_mol_properties())
-    available_groups = set(available_mol_property_groups())
-    resolved: list[str] = []
-
-    if group_list:
-        specs = mol_property_specs()
-        for group in group_list:
-            key = group.strip().lower()
-            if key not in available_groups:
-                raise ValueError(
-                    f"Unknown property group: {group}. Available groups: "
-                    f"{sorted(available_groups)}"
-                )
-            for name, spec in specs.items():
-                if key in spec.groups and name not in resolved:
-                    resolved.append(name)
-
-    if prop_list:
-        for prop in prop_list:
-            normalized = _normalize_name(prop)
-            if normalized not in available_props:
-                raise ValueError(
-                    f"Unknown property: {prop}. Use refua.available_mol_properties() "
-                    "for valid names."
-                )
-            if normalized not in resolved:
-                resolved.append(normalized)
-
-    return resolved
-
-
-def _build_fold_complex(
-    model: Boltz2,
-    *,
-    name: str,
-    chains: list[dict[str, Any]],
-    constraints: list[dict[str, Any]] | None,
-) -> Any:
-    if not chains:
-        raise ValueError("chains must include at least one chain spec.")
-
-    complex_builder = model.fold_complex(name)
-
-    for chain in chains:
-        chain_type = str(chain.get("type", "")).lower()
-        ids = chain.get("id")
-        if not ids:
-            raise ValueError("Each chain must include an 'id'.")
-
-        if chain_type == "protein":
-            sequence = chain.get("sequence")
-            if not sequence:
-                raise ValueError("Protein chains require a sequence.")
-            mods = _coerce_modifications(chain.get("modifications", []))
-            msa = None
-            msa_a3m = chain.get("msa_a3m")
-            if msa_a3m:
-                msa = msa_from_a3m(
-                    str(msa_a3m),
-                    taxonomy=chain.get("msa_taxonomy"),
-                    max_seqs=chain.get("msa_max_seqs"),
-                )
-            complex_builder.protein(
-                ids,
-                sequence,
-                modifications=mods,
-                msa=msa,
-                cyclic=bool(chain.get("cyclic", False)),
-            )
-        elif chain_type == "dna":
-            sequence = chain.get("sequence")
-            if not sequence:
-                raise ValueError("DNA chains require a sequence.")
-            mods = _coerce_modifications(chain.get("modifications", []))
-            complex_builder.dna(
-                ids,
-                sequence,
-                modifications=mods,
-                cyclic=bool(chain.get("cyclic", False)),
-            )
-        elif chain_type == "rna":
-            sequence = chain.get("sequence")
-            if not sequence:
-                raise ValueError("RNA chains require a sequence.")
-            mods = _coerce_modifications(chain.get("modifications", []))
-            complex_builder.rna(
-                ids,
-                sequence,
-                modifications=mods,
-                cyclic=bool(chain.get("cyclic", False)),
-            )
-        elif chain_type == "ligand":
-            smiles = chain.get("smiles")
-            ccd = chain.get("ccd")
-            if (smiles is None) == (ccd is None):
-                raise ValueError("Ligands require exactly one of smiles or ccd.")
-            complex_builder.ligand(ids, ccd=ccd, smiles=smiles)
-        else:
-            raise ValueError(f"Unknown chain type: {chain_type}")
-
-    for constraint in constraints or []:
-        constraint_type = str(constraint.get("type", "")).lower()
-        if constraint_type == "bond":
-            complex_builder.bond(constraint["atom1"], constraint["atom2"])
-        elif constraint_type == "pocket":
-            complex_builder.pocket(
-                constraint["binder"],
-                constraint["contacts"],
-                max_distance=float(constraint.get("max_distance", 6.0)),
-                force=bool(constraint.get("force", False)),
-            )
-        elif constraint_type == "contact":
-            complex_builder.contact(
-                constraint["token1"],
-                constraint["token2"],
-                max_distance=float(constraint.get("max_distance", 6.0)),
-                force=bool(constraint.get("force", False)),
-            )
-        else:
-            raise ValueError(f"Unknown constraint type: {constraint_type}")
-
-    return complex_builder
 
 
 def _write_structure(
@@ -323,21 +530,6 @@ def _save_features(
             arrays[key] = value
     np.savez_compressed(path, **arrays)
     return str(path)
-
-
-def _infer_binder(chains: list[dict[str, Any]]) -> str | None:
-    ligand_ids: list[str] = []
-    for chain in chains:
-        if str(chain.get("type", "")).lower() != "ligand":
-            continue
-        ids = chain.get("id")
-        if isinstance(ids, str):
-            ligand_ids.append(ids)
-        elif isinstance(ids, (list, tuple)):
-            ligand_ids.extend([str(item) for item in ids])
-    if len(ligand_ids) == 1:
-        return ligand_ids[0]
-    return None
 
 
 def _prune_jobs_locked() -> None:
@@ -417,187 +609,180 @@ def _job_snapshot(job_id: str, include_result: bool) -> dict[str, Any]:
 
 
 @mcp.tool()
-def boltz2_fold_complex(
-    chains: list[dict[str, Any]],
+def refua_complex(
+    entities: list[dict[str, Any]],
     *,
     name: str = "complex",
+    base_dir: str | None = None,
     constraints: list[dict[str, Any]] | None = None,
-    cache_dir: str | None = DEFAULT_BOLTZ_CACHE,
-    device: str | None = None,
-    auto_download: bool = True,
-    use_kernels: bool = True,
-    affinity_mw_correction: bool = True,
-    predict_overrides: dict[str, Any] | None = None,
-    output_path: str | None = None,
-    output_format: str | None = None,
-    return_mmcif: bool = False,
-    return_bcif_base64: bool = False,
-    async_mode: bool = False,
-) -> dict[str, Any]:
-    """Fold a complex with Boltz2 and return mmCIF/BCIF output.
-
-    chains: list of chain specs, each with keys:
-      - type: protein | dna | rna | ligand
-      - id: string or list of chain ids
-      - sequence: required for protein/dna/rna
-      - modifications: optional list of {position, ccd}
-      - msa_a3m: optional A3M content (protein only)
-      - cyclic: optional boolean
-      - smiles or ccd: required for ligands
-
-    constraints: optional list with type = bond | pocket | contact.
-    Set async_mode to true to enqueue a long-running job and poll with boltz2_job.
-    """
-    def run() -> dict[str, Any]:
-        model = _get_boltz2(
-            cache_dir,
-            device,
-            auto_download,
-            use_kernels,
-            affinity_mw_correction,
-        )
-        complex_builder = _build_fold_complex(
-            model,
-            name=name,
-            chains=chains,
-            constraints=constraints,
-        )
-
-        overrides = dict(predict_overrides or {})
-        prediction = complex_builder._predict_structure(**overrides)  # noqa: SLF001
-
-        mmcif_text = None
-        bcif_bytes = None
-
-        output_kind = _resolve_output_format(output_path, output_format)
-        if output_kind is None and output_path is not None:
-            output_kind = "cif"
-
-        if output_kind or return_mmcif or return_bcif_base64:
-            mmcif_text = to_mmcif(
-                prediction.structure,
-                plddts=prediction.plddt,
-                boltz2=True,
-            )
-        if output_kind == "bcif" or return_bcif_base64:
-            bcif_bytes = bcif_bytes_from_mmcif(mmcif_text or "")
-
-        output_written = None
-        if output_path and output_kind:
-            output_written = _write_structure(
-                output_path=output_path,
-                output_format=output_kind,
-                mmcif_text=mmcif_text,
-                bcif_bytes=bcif_bytes,
-            )
-
-        result: dict[str, Any] = {
-            "name": name,
-            "confidence_score": prediction.confidence_score,
-            "output_path": output_written,
-            "output_format": output_kind,
-        }
-        if return_mmcif and mmcif_text is not None:
-            result["mmcif"] = mmcif_text
-        if return_bcif_base64 and bcif_bytes is not None:
-            result["bcif_base64"] = base64.b64encode(bcif_bytes).decode("ascii")
-        return result
-
-    if async_mode:
-        job_id = _submit_job("boltz2_fold_complex", run)
-        return {"job_id": job_id, "status": "queued"}
-
-    return run()
-
-
-@mcp.tool()
-def boltz2_affinity(
-    chains: list[dict[str, Any]],
-    *,
-    name: str = "complex",
-    binder: str | None = None,
-    constraints: list[dict[str, Any]] | None = None,
-    cache_dir: str | None = DEFAULT_BOLTZ_CACHE,
-    device: str | None = None,
-    auto_download: bool = True,
-    use_kernels: bool = True,
-    affinity_mw_correction: bool = True,
-    use_structure_prediction: bool = False,
-    crop_affinity: bool = False,
-    override_method: str | None = None,
-    structure_predict_overrides: dict[str, Any] | None = None,
-    affinity_predict_overrides: dict[str, Any] | None = None,
+    affinity: bool | dict[str, Any] | None = None,
+    action: str = "fold",
+    run_boltz: bool | None = None,
+    run_boltzgen: bool | None = None,
+    boltz: dict[str, Any] | None = None,
+    boltzgen: dict[str, Any] | None = None,
     structure_output_path: str | None = None,
     structure_output_format: str | None = None,
     return_mmcif: bool = False,
     return_bcif_base64: bool = False,
+    feature_output_path: str | None = None,
+    feature_output_format: str | None = None,
     async_mode: bool = False,
 ) -> dict[str, Any]:
-    """Predict Boltz2 affinity for a ligand binder.
+    """Run a unified Refua Complex spec.
 
-    Uses the same chain schema as boltz2_fold_complex. Set binder when multiple ligands
-    are present. Set use_structure_prediction to condition affinity on a folded complex.
-    Set async_mode to true to enqueue a long-running job and poll with boltz2_job.
+    entities: list of entity dicts with keys:
+      - type: protein | dna | rna | binder | ligand | file
+      - protein: sequence (required), id/ids, modifications, msa_a3m, binding_types,
+        secondary_structure, cyclic
+      - dna/rna: sequence (required), id/ids, modifications, cyclic
+      - binder: spec or length (required), id/ids, binding_types, secondary_structure, cyclic
+      - ligand: smiles or ccd (required), optional id alias (maps to L1/L2 order)
+      - file: path (required) plus include/exclude/binding_types/etc.
+
+    constraints: list of {type: bond|pocket|contact}. Ligand references use L1/L2
+    (or the provided ligand id alias). DNA/RNA entities are Boltz2-only.
+    action can be "fold" or "affinity".
     """
+
     def run() -> dict[str, Any]:
-        model = _get_boltz2(
-            cache_dir,
-            device,
-            auto_download,
-            use_kernels,
-            affinity_mw_correction,
+        action_value = str(action or "fold").lower()
+        if action_value not in {"fold", "affinity"}:
+            raise ValueError("action must be 'fold' or 'affinity'.")
+
+        boltz_opts = _parse_boltz_options(boltz)
+        boltzgen_opts = _parse_boltzgen_options(boltzgen)
+
+        entity_types = [str(item.get("type", "")).lower() for item in entities]
+        has_boltz_entities = any(
+            kind in {"protein", "dna", "rna", "ligand"} for kind in entity_types
         )
-        complex_builder = _build_fold_complex(
-            model,
+        has_boltzgen_entities = any(
+            kind in {"binder", "file"} for kind in entity_types
+        )
+        wants_affinity = affinity not in (None, False)
+
+        run_boltz_local = (
+            bool(run_boltz)
+            if run_boltz is not None
+            else bool(has_boltz_entities or constraints or wants_affinity)
+        )
+        run_boltzgen_local = (
+            bool(run_boltzgen)
+            if run_boltzgen is not None
+            else bool(has_boltzgen_entities)
+        )
+
+        if action_value == "affinity":
+            run_boltz_local = True
+            run_boltzgen_local = False
+
+        if constraints and not run_boltz_local:
+            raise ValueError("constraints require run_boltz=true.")
+        if wants_affinity and not run_boltz_local and action_value == "fold":
+            raise ValueError("affinity requests require run_boltz=true.")
+
+        boltz_model = None
+        if run_boltz_local or action_value == "affinity":
+            boltz_model = _build_boltz2_from_options(boltz_opts)
+
+        has_ccd = any(
+            str(item.get("type", "")).lower() == "ligand" and item.get("ccd") is not None
+            for item in entities
+        )
+        boltz_mol_dir = None
+        if has_ccd:
+            boltz_mol_dir = _resolve_boltz_mol_dir(boltz_model, boltz_opts)
+            if boltz_mol_dir is None or not boltz_mol_dir.exists():
+                raise FileNotFoundError(
+                    "CCD ligands require Boltz2 molecule assets. "
+                    "Set boltz.cache_dir or enable run_boltz with auto_download."
+                )
+
+        complex_spec, ligand_alias_map, _, _ = _build_complex_from_spec(
             name=name,
-            chains=chains,
-            constraints=constraints,
+            base_dir=base_dir,
+            entities=entities,
+            boltz_mol_dir=boltz_mol_dir,
         )
 
-        binder_id = binder or _infer_binder(chains)
+        _apply_constraints(complex_spec, constraints, ligand_alias_map)
 
-        structure_prediction = None
-        output_kind = _resolve_output_format(structure_output_path, structure_output_format)
-        if output_kind is None and structure_output_path is not None:
-            output_kind = "cif"
+        affinity_requested, affinity_binder = _resolve_affinity_request(
+            affinity, ligand_alias_map
+        )
 
-        if use_structure_prediction or output_kind or return_mmcif or return_bcif_base64:
-            structure_prediction = complex_builder._predict_structure(  # noqa: SLF001
-                **(structure_predict_overrides or {})
+        if action_value == "affinity":
+            affinity_result = complex_spec.affinity(
+                binder=affinity_binder,
+                boltz=boltz_model,
             )
+            output: dict[str, Any] = {
+                "name": name,
+                "binder": affinity_binder,
+                "affinity": {
+                    "ic50": affinity_result.ic50,
+                    "binding_probability": affinity_result.binding_probability,
+                    "ic50_1": affinity_result.ic50_1,
+                    "binding_probability_1": affinity_result.binding_probability_1,
+                    "ic50_2": affinity_result.ic50_2,
+                    "binding_probability_2": affinity_result.binding_probability_2,
+                },
+            }
+            if ligand_alias_map:
+                output["ligand_id_map"] = ligand_alias_map
+            return output
 
-        affinity = complex_builder.get_affinity(
-            binder=binder_id,
-            use_structure_prediction=use_structure_prediction,
-            crop_affinity=crop_affinity,
-            override_method=override_method,
-            **(affinity_predict_overrides or {}),
+        if affinity_requested:
+            complex_spec.request_affinity(affinity_binder)
+
+        boltzgen_model = None
+        if run_boltzgen_local:
+            boltzgen_model = _build_boltzgen_from_options(boltzgen_opts)
+
+        result = complex_spec.fold(
+            boltz=boltz_model,
+            boltzgen=boltzgen_model,
+            run_boltz=run_boltz_local,
+            run_boltzgen=run_boltzgen_local,
         )
 
-        result: dict[str, Any] = {
+        output = {
             "name": name,
-            "binder": binder_id,
-            "affinity": {
-                "ic50": affinity.ic50,
-                "binding_probability": affinity.binding_probability,
-                "ic50_1": affinity.ic50_1,
-                "binding_probability_1": affinity.binding_probability_1,
-                "ic50_2": affinity.ic50_2,
-                "binding_probability_2": affinity.binding_probability_2,
-            },
+            "backend": result.backend,
+            "chain_ids": result.chain_ids,
+            "binder_sequences": result.binder_sequences,
         }
+        if ligand_alias_map:
+            output["ligand_id_map"] = ligand_alias_map
 
-        if structure_prediction is not None:
+        if result.affinity is not None:
+            output["affinity"] = {
+                "ic50": result.affinity.ic50,
+                "binding_probability": result.affinity.binding_probability,
+                "ic50_1": result.affinity.ic50_1,
+                "binding_probability_1": result.affinity.binding_probability_1,
+                "ic50_2": result.affinity.ic50_2,
+                "binding_probability_2": result.affinity.binding_probability_2,
+            }
+
+        if result.structure is None:
+            if structure_output_path or return_mmcif or return_bcif_base64:
+                raise ValueError("Structure output requested but no structure was produced.")
+        else:
+            output_kind = _resolve_output_format(
+                structure_output_path,
+                structure_output_format,
+            )
+            if output_kind is None and structure_output_path is not None:
+                output_kind = "cif"
+
             mmcif_text = None
             bcif_bytes = None
-            if output_kind or return_mmcif or return_bcif_base64:
-                mmcif_text = to_mmcif(
-                    structure_prediction.structure,
-                    plddts=structure_prediction.plddt,
-                    boltz2=True,
-                )
+            if output_kind == "cif" or return_mmcif:
+                mmcif_text = result.to_mmcif()
             if output_kind == "bcif" or return_bcif_base64:
-                bcif_bytes = bcif_bytes_from_mmcif(mmcif_text or "")
+                bcif_bytes = result.to_bcif()
 
             output_written = None
             if structure_output_path and output_kind:
@@ -608,208 +793,55 @@ def boltz2_affinity(
                     bcif_bytes=bcif_bytes,
                 )
 
-            result["structure"] = {
-                "confidence_score": structure_prediction.confidence_score,
+            structure_info: dict[str, Any] = {
+                "confidence_score": result.structure.confidence_score,
                 "output_path": output_written,
                 "output_format": output_kind,
             }
             if return_mmcif and mmcif_text is not None:
-                result["structure"]["mmcif"] = mmcif_text
+                structure_info["mmcif"] = mmcif_text
             if return_bcif_base64 and bcif_bytes is not None:
-                result["structure"]["bcif_base64"] = base64.b64encode(bcif_bytes).decode(
+                structure_info["bcif_base64"] = base64.b64encode(bcif_bytes).decode(
                     "ascii"
                 )
+            output["structure"] = structure_info
 
-        return result
+        features = result.features
+        if features is None:
+            if feature_output_path:
+                raise ValueError("Feature output requested but no features were produced.")
+        else:
+            feature_format = None
+            output_written = None
+            if feature_output_path:
+                feature_format = _resolve_feature_output_format(
+                    feature_output_path, feature_output_format
+                )
+                output_written = _save_features(
+                    output_path=feature_output_path,
+                    output_format=feature_format,
+                    features=features,
+                )
+            output["features"] = {
+                "feature_keys": sorted(features.keys()),
+                "feature_shapes": _summarize_features(features),
+                "output_path": output_written,
+                "output_format": feature_format,
+            }
+
+        return output
 
     if async_mode:
-        job_id = _submit_job("boltz2_affinity", run)
+        job_id = _submit_job("refua_complex", run)
         return {"job_id": job_id, "status": "queued"}
 
     return run()
 
 
 @mcp.tool()
-def boltz2_job(job_id: str, *, include_result: bool = False) -> dict[str, Any]:
-    """Check status for a background Boltz2 job (include_result returns output on success)."""
+def refua_job(job_id: str, *, include_result: bool = False) -> dict[str, Any]:
+    """Check status for a background refua job (include_result returns output on success)."""
     return _job_snapshot(job_id, include_result)
-
-
-@mcp.tool()
-def boltzgen_antibody_design(
-    antigen_path: str,
-    *,
-    antigen_chain: str = "A",
-    binding_range: str | None = "10..40",
-    heavy_id: str = "H",
-    light_id: str = "L",
-    heavy_length: int = 120,
-    light_length: int = 110,
-    heavy_sequence: str | None = None,
-    light_sequence: str | None = None,
-    name: str = "antibody_design",
-    base_dir: str | None = None,
-    mol_dir: str | None = None,
-    auto_download: bool = True,
-    cache_dir: str | None = None,
-    token: str | None = None,
-    force_download: bool = False,
-    output_path: str | None = None,
-    output_format: str | None = None,
-) -> dict[str, Any]:
-    """Prepare BoltzGen antibody design features from an antigen structure."""
-
-    def resolve_design_sequence(explicit: str | None, length: int, label: str) -> str:
-        if explicit:
-            return explicit
-        if length <= 0:
-            raise ValueError(f"{label} length must be positive.")
-        return str(length)
-
-    antigen_file = Path(antigen_path).expanduser().resolve()
-    if not antigen_file.exists():
-        raise FileNotFoundError(f"Antigen file not found: {antigen_file}")
-
-    base_path = Path(base_dir).expanduser().resolve() if base_dir else antigen_file.parent
-
-    gen = _get_boltzgen(mol_dir, auto_download, cache_dir, token, force_download)
-    design = gen.design(name, base_dir=base_path).file(
-        antigen_file,
-        include=[{"chain": {"id": antigen_chain}}],
-        binding_types=(
-            [{"chain": {"id": antigen_chain, "binding": binding_range}}]
-            if binding_range
-            else None
-        ),
-    )
-
-    heavy_seq = resolve_design_sequence(heavy_sequence, heavy_length, "Heavy chain")
-    light_seq = resolve_design_sequence(light_sequence, light_length, "Light chain")
-
-    design.protein(heavy_id, heavy_seq).protein(light_id, light_seq)
-
-    features = design.to_features()
-    summary = _summarize_features(features)
-
-    output_written = None
-    feature_format = None
-    if output_path:
-        feature_format = _resolve_feature_output_format(output_path, output_format)
-        output_written = _save_features(
-            output_path=output_path,
-            output_format=feature_format,
-            features=features,
-        )
-
-    return {
-        "name": name,
-        "feature_keys": sorted(features.keys()),
-        "feature_shapes": summary,
-        "output_path": output_written,
-        "output_format": feature_format,
-    }
-
-
-@mcp.tool()
-def boltzgen_peptide_design(
-    target_path: str,
-    *,
-    target_chain: str = "A",
-    binding_range: str | None = "10..40",
-    peptide_id: str = "P",
-    peptide_spec: str = "12",
-    peptide_cyclic: bool = False,
-    peptide_secondary_structure: str | None = None,
-    name: str = "peptide_binder",
-    base_dir: str | None = None,
-    mol_dir: str | None = None,
-    auto_download: bool = True,
-    cache_dir: str | None = None,
-    token: str | None = None,
-    force_download: bool = False,
-    output_path: str | None = None,
-    output_format: str | None = None,
-) -> dict[str, Any]:
-    """Prepare BoltzGen peptide binder design features from a target structure."""
-    target_file = Path(target_path).expanduser().resolve()
-    if not target_file.exists():
-        raise FileNotFoundError(f"Target file not found: {target_file}")
-
-    base_path = Path(base_dir).expanduser().resolve() if base_dir else target_file.parent
-
-    gen = _get_boltzgen(mol_dir, auto_download, cache_dir, token, force_download)
-    design = gen.design(name, base_dir=base_path).file(
-        target_file,
-        include=[{"chain": {"id": target_chain}}],
-        binding_types=(
-            [{"chain": {"id": target_chain, "binding": binding_range}}]
-            if binding_range
-            else None
-        ),
-    )
-
-    peptide_kwargs: dict[str, Any] = {}
-    if peptide_secondary_structure:
-        peptide_kwargs["secondary_structure"] = peptide_secondary_structure
-
-    design.protein(
-        peptide_id,
-        peptide_spec,
-        cyclic=peptide_cyclic,
-        **peptide_kwargs,
-    )
-
-    features = design.to_features()
-    summary = _summarize_features(features)
-
-    output_written = None
-    feature_format = None
-    if output_path:
-        feature_format = _resolve_feature_output_format(output_path, output_format)
-        output_written = _save_features(
-            output_path=output_path,
-            output_format=feature_format,
-            features=features,
-        )
-
-    return {
-        "name": name,
-        "feature_keys": sorted(features.keys()),
-        "feature_shapes": summary,
-        "output_path": output_written,
-        "output_format": feature_format,
-    }
-
-
-@mcp.tool()
-def small_molecule_properties(
-    smiles: str | list[str],
-    *,
-    properties: list[str] | None = None,
-    groups: list[str] | None = None,
-    sanitize: bool = True,
-    lazy: bool = True,
-) -> dict[str, Any]:
-    """Compute small-molecule properties for SMILES strings.
-
-    If properties or groups are provided, only those properties are returned.
-    Otherwise all registered properties are computed.
-    """
-    smiles_list = _coerce_str_list(smiles, field="smiles")
-    if not smiles_list:
-        raise ValueError("smiles must include at least one string.")
-
-    property_names = _resolve_property_names(properties, groups)
-    results: list[dict[str, Any]] = []
-    for item in smiles_list:
-        props = SM(item, lazy=lazy, sanitize=sanitize)
-        if property_names is None:
-            values = props.to_dict()
-        else:
-            values = {name: props.get(name) for name in property_names}
-        results.append({"smiles": item, "properties": values})
-
-    return {"results": results}
 
 
 def main() -> None:
