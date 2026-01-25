@@ -813,6 +813,7 @@ def refua_complex(
             if feature_output_path:
                 raise ValueError("Feature output requested but no features were produced.")
         else:
+            features = dict(features)  # Convert Mapping to dict for type compatibility
             feature_format = None
             output_written = None
             if feature_output_path:
