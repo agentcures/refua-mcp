@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import statistics
 import threading
 import time
 import traceback
@@ -24,6 +25,9 @@ mcp = FastMCP("refua-mcp")
 DEFAULT_BOLTZ_CACHE = str(Path("~/.boltz").expanduser())
 JOB_HISTORY_LIMIT = 100
 JOB_MAX_WORKERS = 1
+POLL_MIN_SECONDS = 10
+POLL_MAX_SECONDS = 30
+POLL_FRACTION = 0.2
 
 
 @dataclass
@@ -41,6 +45,46 @@ class JobRecord:
 _JOB_LOCK = threading.Lock()
 _JOB_STORE: OrderedDict[str, JobRecord] = OrderedDict()
 _JOB_EXECUTOR = ThreadPoolExecutor(max_workers=JOB_MAX_WORKERS)
+
+
+def _clamp_seconds(value: float, minimum: int, maximum: int) -> int:
+    return int(max(minimum, min(maximum, round(value))))
+
+
+def _recommend_poll_seconds(estimate_seconds: float | None, queue_position: int) -> int:
+    if estimate_seconds is None:
+        return min(POLL_MAX_SECONDS, POLL_MIN_SECONDS + queue_position * 5)
+    estimate_seconds = max(estimate_seconds, float(POLL_MIN_SECONDS))
+    return _clamp_seconds(
+        estimate_seconds * POLL_FRACTION,
+        POLL_MIN_SECONDS,
+        POLL_MAX_SECONDS,
+    )
+
+
+def _median_runtime_seconds_locked() -> float | None:
+    runtimes = [
+        job.finished_at - job.started_at
+        for job in _JOB_STORE.values()
+        if job.started_at is not None and job.finished_at is not None
+    ]
+    if not runtimes:
+        return None
+    return float(statistics.median(runtimes))
+
+
+def _queue_position_locked(job_id: str) -> int:
+    position = 0
+    for existing_id, job in _JOB_STORE.items():
+        if existing_id == job_id:
+            break
+        if job.status in {"queued", "running"}:
+            position += 1
+    return position
+
+
+def _queue_depth_locked() -> int:
+    return sum(1 for job in _JOB_STORE.values() if job.status == "queued")
 
 
 @lru_cache(maxsize=4)
@@ -592,6 +636,7 @@ def _job_snapshot(job_id: str, include_result: bool) -> dict[str, Any]:
         job = _JOB_STORE.get(job_id)
         if job is None:
             raise ValueError(f"Unknown job id: {job_id}")
+        now = time.time()
         snapshot: dict[str, Any] = {
             "job_id": job.job_id,
             "tool": job.tool,
@@ -601,6 +646,29 @@ def _job_snapshot(job_id: str, include_result: bool) -> dict[str, Any]:
             "finished_at": job.finished_at,
             "result_available": job.status == "success",
         }
+        if job.status in {"queued", "running"}:
+            queue_position = _queue_position_locked(job_id)
+            queue_depth = _queue_depth_locked()
+            avg_runtime = _median_runtime_seconds_locked()
+            estimate_seconds: float | None = None
+
+            snapshot["queue_position"] = queue_position
+            snapshot["queue_depth"] = queue_depth
+            if avg_runtime is not None:
+                snapshot["average_runtime_seconds"] = avg_runtime
+                if job.status == "queued" and queue_position > 0:
+                    estimate_seconds = avg_runtime * queue_position
+                    snapshot["estimated_start_seconds"] = estimate_seconds
+                elif job.status == "running":
+                    started_at = job.started_at or job.created_at
+                    elapsed = max(0.0, now - started_at)
+                    estimate_seconds = max(avg_runtime - elapsed, 0.0)
+                    snapshot["estimated_remaining_seconds"] = estimate_seconds
+
+            snapshot["recommended_poll_seconds"] = _recommend_poll_seconds(
+                estimate_seconds,
+                queue_position,
+            )
         if job.status == "error" and job.error:
             snapshot["error"] = job.error
         if include_result and job.status == "success":
@@ -644,7 +712,8 @@ def refua_complex(
     (or the provided ligand id alias). DNA/RNA entities are Boltz2-only.
     action can be "fold" or "affinity".
     Folding can take minutes depending on inputs and hardware; use async_mode for
-    long runs and poll refua_job sparingly (for example, every 90 seconds).
+    long runs and poll refua_job sparingly (for example, every 10-30 seconds) or
+    follow the recommended_poll_seconds returned by refua_job.
     """
 
     def run() -> dict[str, Any]:
@@ -843,7 +912,11 @@ def refua_complex(
 
 @mcp.tool()
 def refua_job(job_id: str, *, include_result: bool = False) -> dict[str, Any]:
-    """Check status for a background refua job (include_result returns output on success)."""
+    """Check status for a background refua job.
+
+    Responses may include recommended_poll_seconds plus queue/estimate metadata for
+    queued or running jobs.
+    """
     return _job_snapshot(job_id, include_result)
 
 
