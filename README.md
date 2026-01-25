@@ -79,7 +79,8 @@ Note: DNA/RNA entities are supported for Boltz2 folding only (BoltzGen does not 
 
 For runs that exceed the tool-call timeout, set `async_mode=true` and poll the job.
 Folding (`action="fold"`) can take minutes depending on inputs and hardware, so poll
-sparingly (for example, every 10-30 seconds with backoff).
+sparingly (for example, every 10-30 seconds with backoff) or follow
+`recommended_poll_seconds` from `refua_job`.
 
 ```json
 {
@@ -102,4 +103,8 @@ Then poll with:
 }
 ```
 
+For queued/running jobs, the response includes `recommended_poll_seconds` plus queue
+and estimate metadata (`queue_position` = jobs ahead, `queue_depth` = queued jobs,
+`average_runtime_seconds`, `estimated_start_seconds`, `estimated_remaining_seconds`)
+to help clients back off.
 Set `include_result=true` once the job is complete to fetch the output.
