@@ -643,6 +643,8 @@ def refua_complex(
     constraints: list of {type: bond|pocket|contact}. Ligand references use L1/L2
     (or the provided ligand id alias). DNA/RNA entities are Boltz2-only.
     action can be "fold" or "affinity".
+    Folding can take minutes depending on inputs and hardware; use async_mode for
+    long runs and poll refua_job sparingly (for example, every 90 seconds).
     """
 
     def run() -> dict[str, Any]:

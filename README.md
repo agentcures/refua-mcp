@@ -77,7 +77,9 @@ Note: DNA/RNA entities are supported for Boltz2 folding only (BoltzGen does not 
 
 ## Long-Running Jobs
 
-For runs that exceed the tool-call timeout, set `async_mode=true` and poll the job:
+For runs that exceed the tool-call timeout, set `async_mode=true` and poll the job.
+Folding (`action="fold"`) can take minutes depending on inputs and hardware, so poll
+sparingly (for example, every 10-30 seconds with backoff).
 
 ```json
 {
