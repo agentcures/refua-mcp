@@ -37,8 +37,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://tensorspace.ai/"
-Repository = "https://github.com/tensorspace-ai/refua-mcp"
+Homepage = "https://agentcures.com/"
+Repository = "https://github.com/agentcures/refua-mcp"
 
 [project.optional-dependencies]
 test = [
