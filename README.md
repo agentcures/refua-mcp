@@ -9,6 +9,12 @@ pip install refua[cuda] # remove [cuda] if you don't need gpu support
 pip install refua-mcp
 ```
 
+ADMET predictions are optional; install `refua[admet]` to enable them:
+
+```bash
+pip install refua[admet]
+```
+
 Boltz2 and BoltzGen require model/molecule assets. If you don't have them, refua can download them for you automatically:
 
 ```bash
@@ -49,10 +55,19 @@ List configured servers with:
 codex mcp list
 ```
 
+If the server is slow to boot (for example on first import of heavy ML deps),
+raise the startup timeout in your Codex `config.toml`:
+
+```toml
+[mcp_servers.refua-mcp]
+startup_timeout_sec = 30
+```
+
 ## Tools
 
-- `refua_complex`: run a unified Complex spec with `action="fold"` (default) or `action="affinity"`.
+- `refua_complex`: run a unified Complex spec with `action="fold"` (default) or `action="affinity"`. Optionally run ADMET for SMILES ligands via `admet` (auto by default when available).
 - `refua_job`: check status for background jobs and optionally return results.
+- `refua_admet_profile` (optional): run model-based ADMET predictions for SMILES strings (only available when `refua[admet]` is installed).
 
 Example (fold a protein + ligand with optional affinity):
 
@@ -68,7 +83,20 @@ Example (fold a protein + ligand with optional affinity):
     "constraints": [
       {"type": "pocket", "binder": "lig", "contacts": [["A", 5], ["A", 8]]}
     ],
-    "affinity": {"binder": "lig"}
+    "affinity": {"binder": "lig"},
+    "admet": true
+  }
+}
+```
+
+Example (ADMET predictions):
+
+```json
+{
+  "tool": "refua_admet_profile",
+  "args": {
+    "smiles": "CCO",
+    "include_scoring": true
   }
 }
 ```
