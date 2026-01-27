@@ -3696,14 +3696,14 @@ typing-extensions = {version = ">=4.4.0", markers = "python_version < \"3.13\""}
 
 [[package]]
 name = "refua"
-version = "0.2.0"
+version = "0.4.0"
 description = "Unified drug discovery ML toolkit"
 optional = false
 python-versions = "<3.15,>=3.11"
 groups = ["main"]
 files = [
-    {file = "refua-0.2.0-py3-none-any.whl", hash = "sha256:8643b9b5c72032bce0b8f07239a3794823778c144d5a987c587200113aaa2c67"},
-    {file = "refua-0.2.0.tar.gz", hash = "sha256:0918a9d6218be34903064979dd446fcc3bf36f0990eff9c6f2595aa37e1e12d6"},
+    {file = "refua-0.4.0-py3-none-any.whl", hash = "sha256:f542338e7c68bb19bcda2109229e191490802b5d09dbc40c0acc68c29d4af563"},
+    {file = "refua-0.4.0.tar.gz", hash = "sha256:3318f7371b0019e9d378b2a895f7e82d2170698d17659750d3a5daf7d35a6fb4"},
 ]
 
 [package.dependencies]
@@ -3736,6 +3736,7 @@ torch = ">=2.4.1"
 tqdm = "*"
 
 [package.extras]
+admet = ["transformers (>=4.45.0)"]
 analysis = ["hydride", "logomaker", "matplotlib", "pandas (>=2.2.2)"]
 cuda = ["cuequivariance_ops_cu12 (>=0.5.0)", "cuequivariance_ops_torch_cu12 (>=0.5.0)", "cuequivariance_torch (>=0.5.0)", "nvidia-ml-py (>=12.535.133)"]
 dev = ["furo (>=2024.1.29)", "myst-parser (>=2.0.0)", "pandas (>=2.2.2)", "pre-commit", "pytest", "redis", "requests", "ruff", "sphinx (>=7)", "sphinx-autodoc-typehints (>=1.25.2)", "types-requests (>=2.32.4)", "wandb (>=0.18.7)"]
@@ -4691,4 +4692,4 @@ test = ["pytest"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.14"
-content-hash = "51d93b72fccc0b0f4963e2f6f6c21d98f1c390c0ef60e99e07651d719461803e"
+content-hash = "319b400eb5627e2df8117b056802e6a67fb7186b61ff2381c13e631a864dbd68"
