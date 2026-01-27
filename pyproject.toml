@@ -48,6 +48,9 @@ dev = [
   "pre-commit>=4.1",
 ]
 
+[tool.poetry.group.dev.dependencies]
+pre-commit = ">=4.1"
+
 [project.scripts]
 refua-mcp = "refua_mcp.server:main"
 
