@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import importlib.util
 import statistics
 import threading
 import time
@@ -11,14 +12,16 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 
-import numpy as np
-import torch
 from mcp.server.fastmcp import FastMCP
-from refua import Binder, Boltz2, BoltzGen, Complex, DNA, Protein, RNA, SmallMolecule
-from refua.boltz.api import msa_from_a3m
-from refua.boltz.data.mol import load_molecules
+
+if TYPE_CHECKING:
+    from refua import Boltz2, BoltzGen, Complex, SmallMolecule
+    from refua.admet import AdmetPredictor  # type: ignore[reportMissingImports]
+else:
+    Boltz2 = BoltzGen = Complex = SmallMolecule = Any
+    AdmetPredictor = Any
 
 mcp = FastMCP("refua-mcp")
 
@@ -28,6 +31,18 @@ JOB_MAX_WORKERS = 1
 POLL_MIN_SECONDS = 10
 POLL_MAX_SECONDS = 30
 POLL_FRACTION = 0.2
+ADMET_DEPENDENCIES = ("transformers", "huggingface_hub")
+
+
+def _module_available(name: str) -> bool:
+    return importlib.util.find_spec(name) is not None
+
+
+def _admet_available() -> bool:
+    return all(_module_available(dep) for dep in ADMET_DEPENDENCIES)
+
+
+_ADMET_AVAILABLE = _admet_available()
 
 
 @dataclass
@@ -95,6 +110,8 @@ def _get_boltz2(
     use_kernels: bool,
     affinity_mw_correction: bool,
 ) -> Boltz2:
+    from refua import Boltz2
+
     if not cache_dir:
         cache_dir = DEFAULT_BOLTZ_CACHE
     return Boltz2(
@@ -114,6 +131,8 @@ def _get_boltzgen(
     token: str | None,
     force_download: bool,
 ) -> BoltzGen:
+    from refua import BoltzGen
+
     return BoltzGen(
         mol_dir=mol_dir,
         auto_download=auto_download,
@@ -149,6 +168,92 @@ def _parse_boltzgen_options(options: Mapping[str, Any] | None) -> dict[str, Any]
     return opts
 
 
+def _parse_admet_options(admet: Any) -> tuple[str, dict[str, Any]]:
+    if admet is None:
+        return "auto", {}
+    if admet is False:
+        return "off", {}
+    if admet is True:
+        return "on", {}
+    if isinstance(admet, str):
+        mode = str(admet).lower()
+        if mode not in {"auto", "on", "off"}:
+            raise ValueError("admet must be 'auto', 'on', 'off', a bool, or a dict.")
+        return mode, {}
+    if isinstance(admet, Mapping):
+        opts = dict(admet)
+        mode_value = opts.pop("mode", None)
+        enabled = opts.pop("enabled", None)
+        if enabled is not None:
+            mode_value = "on" if bool(enabled) else "off"
+        if mode_value is None:
+            mode_value = "on"
+        mode = str(mode_value).lower()
+        if mode not in {"auto", "on", "off"}:
+            raise ValueError("admet.mode must be 'auto', 'on', or 'off'.")
+        known = {
+            "ligands",
+            "model_variant",
+            "max_new_tokens",
+            "include_scoring",
+            "task_ids",
+        }
+        unknown = set(opts) - known
+        if unknown:
+            raise ValueError(f"Unknown admet options: {sorted(unknown)}")
+        return mode, opts
+    raise ValueError("admet must be 'auto', 'on', 'off', a bool, a dict, or None.")
+
+
+def _normalize_admet_ligands(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError("admet.ligands cannot be empty.")
+        return [str(item) for item in value]
+    raise ValueError("admet.ligands must be a string or list of strings.")
+
+
+def _select_admet_ligands(
+    ligand_specs: list[dict[str, Any]],
+    requested: list[str] | None,
+    alias_map: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    if requested is None:
+        return ligand_specs
+    resolved: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ligand in requested:
+        ligand_id = alias_map.get(str(ligand), str(ligand))
+        match = next(
+            (spec for spec in ligand_specs if spec["ligand_id"] == ligand_id),
+            None,
+        )
+        if match is None:
+            raise ValueError(f"Unknown ligand id for admet: {ligand}")
+        if ligand_id in seen:
+            continue
+        seen.add(ligand_id)
+        resolved.append(match)
+    return resolved
+
+
+def _normalize_admet_task_ids(
+    task_ids: Iterable[Any] | None,
+) -> tuple[str, ...] | None:
+    if task_ids is None:
+        return None
+    if isinstance(task_ids, str):
+        raise ValueError("task_ids must be a list of strings.")
+    normalized = tuple(str(task_id) for task_id in task_ids)
+    if not normalized:
+        raise ValueError("task_ids cannot be empty.")
+    return normalized
+
+
 def _build_boltz2_from_options(options: Mapping[str, Any] | None) -> Boltz2:
     opts = _parse_boltz_options(options)
     cache_dir = opts.get("cache_dir", DEFAULT_BOLTZ_CACHE)
@@ -160,6 +265,8 @@ def _build_boltz2_from_options(options: Mapping[str, Any] | None) -> Boltz2:
     affinity_predict_args = opts.get("affinity_predict_args")
 
     if predict_args is not None or affinity_predict_args is not None:
+        from refua import Boltz2
+
         return Boltz2(
             cache_dir=cache_dir,
             device=device,
@@ -229,6 +336,8 @@ def _resolve_msa(entity: Mapping[str, Any]) -> object | None:
     msa_a3m = entity.get("msa_a3m")
     if not msa_a3m:
         return None
+    from refua.boltz.api import msa_from_a3m
+
     return msa_from_a3m(
         str(msa_a3m),
         taxonomy=entity.get("msa_taxonomy"),
@@ -238,6 +347,8 @@ def _resolve_msa(entity: Mapping[str, Any]) -> object | None:
 
 @lru_cache(maxsize=128)
 def _load_ccd_mol(mol_dir: str, ccd: str) -> Any:
+    from refua.boltz.data.mol import load_molecules
+
     return load_molecules(mol_dir, [ccd])[ccd]
 
 
@@ -257,6 +368,8 @@ def _make_ligand(
     ccd: str | None,
     mol_dir: Path | None,
 ) -> SmallMolecule:
+    from refua import SmallMolecule
+
     if (smiles is None) == (ccd is None):
         raise ValueError("Ligands require exactly one of smiles or ccd.")
     if smiles is not None:
@@ -274,6 +387,8 @@ def _build_complex_from_spec(
     entities: list[dict[str, Any]],
     boltz_mol_dir: Path | None,
 ) -> tuple[Complex, dict[str, str], bool, bool]:
+    from refua import Binder, Complex, DNA, Protein, RNA
+
     if not entities:
         raise ValueError("entities must include at least one entity spec.")
 
@@ -544,6 +659,9 @@ def _write_structure(
 
 
 def _summarize_features(features: dict[str, Any]) -> dict[str, list[int]]:
+    import numpy as np
+    import torch
+
     summary: dict[str, list[int]] = {}
     for key, value in features.items():
         if torch.is_tensor(value):
@@ -559,6 +677,9 @@ def _save_features(
     output_format: str,
     features: dict[str, Any],
 ) -> str:
+    import numpy as np
+    import torch
+
     path = Path(output_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -689,6 +810,7 @@ def refua_complex(
     run_boltzgen: bool | None = None,
     boltz: dict[str, Any] | None = None,
     boltzgen: dict[str, Any] | None = None,
+    admet: bool | str | dict[str, Any] | None = None,
     structure_output_path: str | None = None,
     structure_output_format: str | None = None,
     return_mmcif: bool = False,
@@ -711,6 +833,10 @@ def refua_complex(
     constraints: list of {type: bond|pocket|contact}. Ligand references use L1/L2
     (or the provided ligand id alias). DNA/RNA entities are Boltz2-only.
     action can be "fold" or "affinity".
+    admet: run optional ADMET predictions for ligand SMILES. Use true/"on" to
+    force, false/"off" to disable, or omit for auto (runs when SMILES ligands
+    are present and ADMET deps are installed). Dict options: mode, ligands,
+    model_variant, max_new_tokens, include_scoring, task_ids.
     Folding can take minutes depending on inputs and hardware; use async_mode for
     long runs and poll refua_job sparingly (for example, every 10-30 seconds) or
     follow the recommended_poll_seconds returned by refua_job.
@@ -723,6 +849,19 @@ def refua_complex(
 
         boltz_opts = _parse_boltz_options(boltz)
         boltzgen_opts = _parse_boltzgen_options(boltzgen)
+        admet_mode, admet_opts = _parse_admet_options(admet)
+
+        ligand_specs: list[dict[str, Any]] = []
+        ligand_index = 1
+        for item in entities:
+            if not isinstance(item, Mapping):
+                continue
+            if str(item.get("type", "")).lower() == "ligand":
+                ligand_id = f"L{ligand_index}"
+                ligand_index += 1
+                smiles = item.get("smiles")
+                if smiles is not None:
+                    ligand_specs.append({"ligand_id": ligand_id, "smiles": str(smiles)})
 
         entity_types = [str(item.get("type", "")).lower() for item in entities]
         has_boltz_entities = any(
@@ -779,6 +918,56 @@ def refua_complex(
 
         _apply_constraints(complex_spec, constraints, ligand_alias_map)
 
+        admet_output: dict[str, Any] | None = None
+        if admet_mode != "off":
+            has_smiles_ligands = bool(ligand_specs)
+            wants_admet = admet_mode == "on" or (
+                admet_mode == "auto" and has_smiles_ligands
+            )
+            if wants_admet:
+                if not _ADMET_AVAILABLE:
+                    if admet_mode == "on":
+                        raise ValueError(
+                            "ADMET requested but refua[admet] is not installed."
+                        )
+                    admet_output = {
+                        "status": "unavailable",
+                        "reason": "Install refua[admet] to enable ADMET predictions.",
+                    }
+                else:
+                    requested = _normalize_admet_ligands(admet_opts.get("ligands"))
+                    targets = _select_admet_ligands(
+                        ligand_specs,
+                        requested,
+                        ligand_alias_map,
+                    )
+                    if not targets:
+                        if admet_mode == "on":
+                            raise ValueError(
+                                "ADMET requested but no SMILES ligands are available."
+                            )
+                    else:
+                        normalized_tasks = _normalize_admet_task_ids(
+                            admet_opts.get("task_ids")
+                        )
+                        model_variant = str(admet_opts.get("model_variant", "9b-chat"))
+                        max_new_tokens = int(admet_opts.get("max_new_tokens", 8))
+                        include_scoring = bool(
+                            admet_opts.get("include_scoring", True)
+                        )
+                        results = []
+                        for target in targets:
+                            profile = _admet_analyze(
+                                smiles=target["smiles"],
+                                model_variant=model_variant,
+                                max_new_tokens=max_new_tokens,
+                                include_scoring=include_scoring,
+                                task_ids=normalized_tasks,
+                            )
+                            profile["ligand_id"] = target["ligand_id"]
+                            results.append(profile)
+                        admet_output = {"status": "success", "results": results}
+
         affinity_requested, affinity_binder = _resolve_affinity_request(
             affinity, ligand_alias_map
         )
@@ -802,6 +991,8 @@ def refua_complex(
             }
             if ligand_alias_map:
                 output["ligand_id_map"] = ligand_alias_map
+            if admet_output is not None:
+                output["admet"] = admet_output
             return output
 
         if affinity_requested:
@@ -826,6 +1017,8 @@ def refua_complex(
         }
         if ligand_alias_map:
             output["ligand_id_map"] = ligand_alias_map
+        if admet_output is not None:
+            output["admet"] = admet_output
 
         if result.affinity is not None:
             output["affinity"] = {
@@ -918,6 +1111,76 @@ def refua_job(job_id: str, *, include_result: bool = False) -> dict[str, Any]:
     queued or running jobs.
     """
     return _job_snapshot(job_id, include_result)
+
+
+if _ADMET_AVAILABLE:
+    @lru_cache(maxsize=4)
+    def _get_admet_predictor(
+        model_variant: str,
+        task_ids: tuple[str, ...] | None,
+    ) -> AdmetPredictor:
+        from refua.admet import AdmetPredictor  # type: ignore[reportMissingImports]
+
+        return AdmetPredictor(model_variant=model_variant, task_ids=task_ids)
+
+    def _admet_analyze(
+        *,
+        smiles: str,
+        model_variant: str,
+        max_new_tokens: int,
+        include_scoring: bool,
+        task_ids: tuple[str, ...] | None,
+    ) -> dict[str, Any]:
+        from refua.admet import AdmetScorer, admet_profile  # type: ignore[reportMissingImports]
+
+        if task_ids is None:
+            return admet_profile(
+                smiles,
+                model_variant=model_variant,
+                max_new_tokens=max_new_tokens,
+                include_scoring=include_scoring,
+            )
+
+        predictor = _get_admet_predictor(model_variant, task_ids)
+        predictions, raw_outputs = predictor.predict(
+            smiles,
+            max_new_tokens=max_new_tokens,
+        )
+        result: dict[str, Any] = {
+            "smiles": smiles,
+            "predictions": predictions,
+            "raw_outputs": raw_outputs,
+            "missing_tasks": list(predictor.missing_task_ids),
+        }
+        if include_scoring:
+            scorer = AdmetScorer()
+            result.update(scorer.analyze_profile(predictions))
+        return result
+
+    @mcp.tool()
+    def refua_admet_profile(
+        smiles: str,
+        *,
+        model_variant: str = "9b-chat",
+        max_new_tokens: int = 8,
+        include_scoring: bool = True,
+        task_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Run model-based ADMET predictions for a SMILES string.
+
+        Requires refua[admet] (transformers + huggingface_hub). Optionally pass
+        task_ids to restrict the endpoints that are evaluated.
+        """
+        if not smiles:
+            raise ValueError("smiles is required.")
+        normalized_tasks = _normalize_admet_task_ids(task_ids)
+        return _admet_analyze(
+            smiles=str(smiles),
+            model_variant=str(model_variant),
+            max_new_tokens=int(max_new_tokens),
+            include_scoring=bool(include_scoring),
+            task_ids=normalized_tasks,
+        )
 
 
 def main() -> None:
