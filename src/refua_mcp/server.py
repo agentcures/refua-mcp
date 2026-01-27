@@ -414,7 +414,9 @@ def _build_complex_from_spec(
                 Protein(
                     str(sequence),
                     ids=ids,
-                    modifications=_coerce_modifications(entity.get("modifications", [])),
+                    modifications=_coerce_modifications(
+                        entity.get("modifications", [])
+                    ),
                     msa=_resolve_msa(entity),
                     binding_types=entity.get("binding_types"),
                     secondary_structure=entity.get("secondary_structure"),
@@ -433,7 +435,9 @@ def _build_complex_from_spec(
                 DNA(
                     str(sequence),
                     ids=ids,
-                    modifications=_coerce_modifications(entity.get("modifications", [])),
+                    modifications=_coerce_modifications(
+                        entity.get("modifications", [])
+                    ),
                     cyclic=bool(entity.get("cyclic", False)),
                 )
             )
@@ -449,7 +453,9 @@ def _build_complex_from_spec(
                 RNA(
                     str(sequence),
                     ids=ids,
-                    modifications=_coerce_modifications(entity.get("modifications", [])),
+                    modifications=_coerce_modifications(
+                        entity.get("modifications", [])
+                    ),
                     cyclic=bool(entity.get("cyclic", False)),
                 )
             )
@@ -609,7 +615,9 @@ def _resolve_affinity_request(
     raise ValueError("affinity must be a bool or dict with optional binder.")
 
 
-def _resolve_output_format(output_path: str | None, output_format: str | None) -> str | None:
+def _resolve_output_format(
+    output_path: str | None, output_format: str | None
+) -> str | None:
     if output_format:
         normalized = output_format.lower()
         if normalized not in {"cif", "bcif"}:
@@ -867,9 +875,7 @@ def refua_complex(
         has_boltz_entities = any(
             kind in {"protein", "dna", "rna", "ligand"} for kind in entity_types
         )
-        has_boltzgen_entities = any(
-            kind in {"binder", "file"} for kind in entity_types
-        )
+        has_boltzgen_entities = any(kind in {"binder", "file"} for kind in entity_types)
         wants_affinity = affinity not in (None, False)
 
         run_boltz_local = (
@@ -897,7 +903,8 @@ def refua_complex(
             boltz_model = _build_boltz2_from_options(boltz_opts)
 
         has_ccd = any(
-            str(item.get("type", "")).lower() == "ligand" and item.get("ccd") is not None
+            str(item.get("type", "")).lower() == "ligand"
+            and item.get("ccd") is not None
             for item in entities
         )
         boltz_mol_dir = None
@@ -952,9 +959,7 @@ def refua_complex(
                         )
                         model_variant = str(admet_opts.get("model_variant", "9b-chat"))
                         max_new_tokens = int(admet_opts.get("max_new_tokens", 8))
-                        include_scoring = bool(
-                            admet_opts.get("include_scoring", True)
-                        )
+                        include_scoring = bool(admet_opts.get("include_scoring", True))
                         results = []
                         for target in targets:
                             profile = _admet_analyze(
@@ -1032,7 +1037,9 @@ def refua_complex(
 
         if result.structure is None:
             if structure_output_path or return_mmcif or return_bcif_base64:
-                raise ValueError("Structure output requested but no structure was produced.")
+                raise ValueError(
+                    "Structure output requested but no structure was produced."
+                )
         else:
             output_kind = _resolve_output_format(
                 structure_output_path,
@@ -1073,7 +1080,9 @@ def refua_complex(
         features = result.features
         if features is None:
             if feature_output_path:
-                raise ValueError("Feature output requested but no features were produced.")
+                raise ValueError(
+                    "Feature output requested but no features were produced."
+                )
         else:
             features = dict(features)  # Convert Mapping to dict for type compatibility
             feature_format = None
@@ -1114,6 +1123,7 @@ def refua_job(job_id: str, *, include_result: bool = False) -> dict[str, Any]:
 
 
 if _ADMET_AVAILABLE:
+
     @lru_cache(maxsize=4)
     def _get_admet_predictor(
         model_variant: str,
