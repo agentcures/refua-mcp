@@ -65,7 +65,7 @@ startup_timeout_sec = 30
 
 ## Tools
 
-- `refua_complex`: run a unified Complex spec with `action="fold"` (default) or `action="affinity"`. Optionally run ADMET for SMILES ligands via `admet` (auto by default when available).
+- `refua_complex`: run a unified Complex spec with `action="fold"` (default) or `action="affinity"`. Supports `protein|dna|rna|binder|peptide|antibody|ligand|file` entities. Optionally run ADMET for SMILES ligands via `admet` (auto by default when available).
 - `refua_job`: check status for background jobs and optionally return results.
 - `refua_admet_profile` (optional): run model-based ADMET predictions for SMILES strings (only available when `refua[admet]` is installed).
 
@@ -97,6 +97,22 @@ Example (ADMET predictions):
   "args": {
     "smiles": "CCO",
     "include_scoring": true
+  }
+}
+```
+
+Example (antibody helper + peptide helper):
+
+```json
+{
+  "tool": "refua_complex",
+  "args": {
+    "name": "design_helpers",
+    "entities": [
+      {"type": "protein", "id": "A", "sequence": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ"},
+      {"type": "antibody", "ids": ["H", "L"], "heavy_cdr_lengths": [12, 10, 14], "light_cdr_lengths": [10, 9, 9]},
+      {"type": "peptide", "id": "P", "segment_lengths": [10, 6, 3], "disulfide": true}
+    ]
   }
 }
 ```
