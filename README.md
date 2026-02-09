@@ -74,6 +74,19 @@ startup_timeout_sec = 30
 
 All major tools expose strict JSON schemas, including discriminated entity unions by `type` and typed output schemas.
 
+Output-format notes:
+- `structure_output_format`: canonical values are `cif` or `bcif`; `mmcif` is accepted as a compatibility alias for `cif`.
+- `feature_output_format`: use `torch` or `npz` when writing feature files. If `json` is provided with a file output request, the server normalizes it to `npz` and reports a warning.
+- If `feature_output_path` ends with `.json`, the server normalizes it to `.npz` for feature file export.
+- Fold/design responses include a `warnings` list when compatibility normalization is applied.
+
+Input-compatibility notes:
+- For compatibility with some MCP clients, `entities`, `constraints`, `antibody`, and `context_entities` also accept JSON-encoded strings and will be normalized server-side.
+
+Execution-policy notes:
+- `refua_fold` and `refua_antibody_design` block exploratory names by default (for example `sanity_*`, `*_probe`, `schema_*`, `smoke_*`) to avoid costly preflight runs.
+- If an exploratory run is intentionally needed, set `allow_exploratory_run=true`.
+
 ## Resources And Templates
 
 - `refua://recipes/index` (resource): lists canonical recipe names.
