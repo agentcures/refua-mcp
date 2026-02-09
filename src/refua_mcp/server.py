@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import re
 import statistics
 import threading
 import time
@@ -22,7 +23,7 @@ from mcp.types import TaskExecutionMode
 from mcp.types import TasksCallCapability
 from mcp.types import Tool as McpTool
 from mcp.types import ToolExecution
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 if TYPE_CHECKING:
     from refua import Boltz2, BoltzGen, Complex, SmallMolecule
@@ -38,6 +39,7 @@ Recommended sequence:
 1) Read recipe resources (`refua://recipes/index` and `refua://recipes/{recipe_name}`)
    for canonical call shapes.
 2) Call `refua_validate_spec` to normalize/validate before expensive work.
+   Do not execute schema probes, sanity folds, or smoke-test designs.
 3) Execute with the focused tool:
    - `refua_fold` for structure/design folds
    - `refua_affinity` for affinity-only predictions
@@ -70,6 +72,10 @@ def _admet_available() -> bool:
 
 
 _ADMET_AVAILABLE = _admet_available()
+_PROBE_RUN_NAME_RE = re.compile(
+    r"(sanity|probe|schema|smoke|dry[_\-\s]?run)",
+    re.IGNORECASE,
+)
 
 
 class StrictModel(BaseModel):
@@ -329,6 +335,13 @@ class AdmetOptions(StrictModel):
 
 AdmetArg = bool | Literal["auto", "on", "off"] | AdmetOptions | None
 AffinityArg = bool | AffinityOptions | None
+StructureOutputFormatArg = Literal["cif", "mmcif", "bcif"] | None
+FeatureOutputFormatArg = Literal["torch", "npz", "json"] | None
+
+_ANTIBODY_ENTITY_ADAPTER = TypeAdapter(AntibodyEntity)
+_ENTITY_LIST_ADAPTER = TypeAdapter(list[EntitySpec])
+_CONTEXT_ENTITY_LIST_ADAPTER = TypeAdapter(list[ContextEntitySpec])
+_CONSTRAINT_LIST_ADAPTER = TypeAdapter(list[ConstraintSpec])
 
 
 class AffinityResult(StrictModel):
@@ -365,6 +378,7 @@ class FoldResult(StrictModel):
     affinity: AffinityResult | None = None
     structure: StructureResult | None = None
     features: FeatureResult | None = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 class AffinityResultResponse(StrictModel):
@@ -572,12 +586,13 @@ async def _call_tool_with_task_support(
 
     # Non task-augmented calls behave exactly like standard FastMCP tool execution.
     if experimental is None or not experimental.is_task:
-        return await mcp._tool_manager.call_tool(
+        result = await mcp._tool_manager.call_tool(
             name,
             arguments,
             context=context,
-            convert_result=False,
+            convert_result=True,
         )
+        return _normalize_task_tool_result(result)
 
     runner = _build_task_runner(name, arguments)
     if runner is None:
@@ -903,6 +918,146 @@ def _coerce_triplet(
     if any(item < 1 for item in normalized):
         raise ValueError(f"{field} values must be >= 1.")
     return normalized
+
+
+def _parse_json_string_arg(value: Any, *, field_name: str) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        raise ValueError(f"{field_name} cannot be an empty string.")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{field_name} must be valid JSON when provided as a string."
+        ) from exc
+
+
+def _parse_json_strings_in_list(value: Any, *, field_name: str) -> Any:
+    if not isinstance(value, (list, tuple)):
+        return value
+    normalized: list[Any] = []
+    for index, item in enumerate(value):
+        normalized.append(
+            _parse_json_string_arg(item, field_name=f"{field_name}[{index}]")
+        )
+    return normalized
+
+
+def _normalize_entities_arg(entities: list[EntitySpec | str] | str) -> list[EntitySpec]:
+    parsed = _parse_json_string_arg(entities, field_name="entities")
+    parsed = _parse_json_strings_in_list(parsed, field_name="entities")
+    return _ENTITY_LIST_ADAPTER.validate_python(parsed)
+
+
+def _normalize_constraints_arg(
+    constraints: list[ConstraintSpec | str] | str | None,
+) -> list[ConstraintSpec] | None:
+    if constraints is None:
+        return None
+    parsed = _parse_json_string_arg(constraints, field_name="constraints")
+    parsed = _parse_json_strings_in_list(parsed, field_name="constraints")
+    return _CONSTRAINT_LIST_ADAPTER.validate_python(parsed)
+
+
+def _normalize_antibody_arg(antibody: AntibodyEntity | str) -> AntibodyEntity:
+    return _ANTIBODY_ENTITY_ADAPTER.validate_python(
+        _parse_json_string_arg(antibody, field_name="antibody")
+    )
+
+
+def _normalize_context_entities_arg(
+    context_entities: list[ContextEntitySpec | str] | str | None,
+) -> list[ContextEntitySpec] | None:
+    if context_entities is None:
+        return None
+    parsed = _parse_json_string_arg(context_entities, field_name="context_entities")
+    parsed = _parse_json_strings_in_list(parsed, field_name="context_entities")
+    return _CONTEXT_ENTITY_LIST_ADAPTER.validate_python(parsed)
+
+
+def _enforce_non_exploratory_execution(
+    name: str,
+    *,
+    allow_exploratory_run: bool,
+) -> None:
+    if allow_exploratory_run:
+        return
+    if _PROBE_RUN_NAME_RE.search(str(name)):
+        raise ValueError(
+            "Exploratory/sanity execution names are blocked by default. "
+            "Use refua_validate_spec for schema checks, or set "
+            "allow_exploratory_run=true to override."
+        )
+
+
+def _normalize_output_requests(
+    *,
+    structure_output_path: str | None,
+    structure_output_format: str | None,
+    feature_output_path: str | None,
+    feature_output_format: str | None,
+) -> tuple[str | None, str | None, str | None, str | None, list[str]]:
+    warnings: list[str] = []
+
+    normalized_structure_format = (
+        _resolve_output_format(None, structure_output_format)
+        if structure_output_format is not None
+        else None
+    )
+    if (
+        structure_output_format is not None
+        and str(structure_output_format).strip().lower() == "mmcif"
+    ):
+        warnings.append("structure_output_format='mmcif' was normalized to 'cif'.")
+
+    normalized_feature_path = feature_output_path
+    normalized_feature_format = (
+        str(feature_output_format).strip().lower()
+        if feature_output_format is not None
+        else None
+    )
+
+    if feature_output_path is not None:
+        feature_suffix = Path(feature_output_path).suffix.lower()
+
+        if normalized_feature_format == "json":
+            normalized_feature_format = "npz"
+            if feature_suffix == ".json":
+                normalized_feature_path = str(
+                    Path(feature_output_path).with_suffix(".npz")
+                )
+                warnings.append(
+                    "feature_output_format='json' is not a file format; normalized to "
+                    f"'npz' and feature_output_path to '{normalized_feature_path}'."
+                )
+            else:
+                warnings.append(
+                    "feature_output_format='json' is not a file format; normalized to "
+                    "'npz'."
+                )
+        elif normalized_feature_format is None and feature_suffix == ".json":
+            normalized_feature_format = "npz"
+            normalized_feature_path = str(Path(feature_output_path).with_suffix(".npz"))
+            warnings.append(
+                "feature_output_path ending in '.json' is not supported for feature files; "
+                f"normalized to '{normalized_feature_path}' with format 'npz'."
+            )
+
+        if normalized_feature_format is not None:
+            normalized_feature_format = _resolve_feature_output_format(
+                normalized_feature_path or feature_output_path,
+                normalized_feature_format,
+            )
+
+    return (
+        structure_output_path,
+        normalized_structure_format,
+        normalized_feature_path,
+        normalized_feature_format,
+        warnings,
+    )
 
 
 def _resolve_entity_ids(entity: Mapping[str, Any]) -> str | tuple[str, ...] | None:
@@ -1380,8 +1535,10 @@ def _resolve_output_format(
 ) -> str | None:
     if output_format:
         normalized = output_format.lower()
-        if normalized not in {"cif", "bcif"}:
-            raise ValueError("output_format must be 'cif' or 'bcif'.")
+        if normalized not in {"cif", "mmcif", "bcif"}:
+            raise ValueError("output_format must be 'cif', 'mmcif', or 'bcif'.")
+        if normalized == "mmcif":
+            return "cif"
         return normalized
     if output_path:
         suffix = Path(output_path).suffix.lower()
@@ -1395,6 +1552,11 @@ def _resolve_output_format(
 def _resolve_feature_output_format(output_path: str, output_format: str | None) -> str:
     if output_format:
         normalized = output_format.lower()
+        if normalized == "json":
+            raise ValueError(
+                "output_format='json' is only valid for inline MCP response summaries. "
+                "For file output, use 'torch' or 'npz'."
+            )
         if normalized not in {"torch", "npz"}:
             raise ValueError("output_format must be 'torch' or 'npz'.")
         return normalized
@@ -1738,6 +1900,7 @@ def _run_complex_operation(
     return_bcif_base64: bool,
     feature_output_path: str | None,
     feature_output_format: str | None,
+    output_warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     boltz_opts = _parse_boltz_options(boltz)
     boltzgen_opts = _parse_boltzgen_options(boltzgen)
@@ -1867,6 +2030,8 @@ def _run_complex_operation(
         "chain_ids": result.chain_ids,
         "binder_sequences": result.binder_sequences,
     }
+    if output_warnings:
+        output["warnings"] = list(output_warnings)
     if ligand_alias_map:
         output["ligand_id_map"] = ligand_alias_map
     if admet_output is not None:
@@ -1949,11 +2114,11 @@ def _queue_job(tool_name: str, runner: Callable[[], BaseModel]) -> QueuedJobResp
 
 @mcp.tool()
 def refua_fold(
-    entities: list[EntitySpec],
+    entities: list[EntitySpec | str] | str,
     *,
     name: str = "complex",
     base_dir: str | None = None,
-    constraints: list[ConstraintSpec] | None = None,
+    constraints: list[ConstraintSpec | str] | str | None = None,
     affinity: AffinityArg = None,
     run_boltz: bool | None = None,
     run_boltzgen: bool | None = None,
@@ -1961,17 +2126,36 @@ def refua_fold(
     boltzgen: BoltzGenOptions | None = None,
     admet: AdmetArg = None,
     structure_output_path: str | None = None,
-    structure_output_format: Literal["cif", "bcif"] | None = None,
+    structure_output_format: StructureOutputFormatArg = None,
     return_mmcif: bool = False,
     return_bcif_base64: bool = False,
     feature_output_path: str | None = None,
-    feature_output_format: Literal["torch", "npz"] | None = None,
+    feature_output_format: FeatureOutputFormatArg = None,
+    allow_exploratory_run: bool = False,
     async_mode: bool = False,
 ) -> FoldResult | QueuedJobResponse:
     """Run Refua fold/design workflows with strict typed inputs."""
 
-    entities_payload = _entities_to_payload(entities)
-    constraints_payload = _constraints_to_payload(constraints)
+    _enforce_non_exploratory_execution(
+        name,
+        allow_exploratory_run=allow_exploratory_run,
+    )
+    normalized_entities = _normalize_entities_arg(entities)
+    normalized_constraints = _normalize_constraints_arg(constraints)
+    (
+        normalized_structure_output_path,
+        normalized_structure_output_format,
+        normalized_feature_output_path,
+        normalized_feature_output_format,
+        output_warnings,
+    ) = _normalize_output_requests(
+        structure_output_path=structure_output_path,
+        structure_output_format=structure_output_format,
+        feature_output_path=feature_output_path,
+        feature_output_format=feature_output_format,
+    )
+    entities_payload = _entities_to_payload(normalized_entities)
+    constraints_payload = _constraints_to_payload(normalized_constraints)
     affinity_payload = _normalize_affinity_arg(affinity)
     boltz_payload = _model_dict(boltz)
     boltzgen_payload = _model_dict(boltzgen)
@@ -1990,12 +2174,13 @@ def refua_fold(
             boltz=boltz_payload,
             boltzgen=boltzgen_payload,
             admet=admet_payload,
-            structure_output_path=structure_output_path,
-            structure_output_format=structure_output_format,
+            structure_output_path=normalized_structure_output_path,
+            structure_output_format=normalized_structure_output_format,
             return_mmcif=return_mmcif,
             return_bcif_base64=return_bcif_base64,
-            feature_output_path=feature_output_path,
-            feature_output_format=feature_output_format,
+            feature_output_path=normalized_feature_output_path,
+            feature_output_format=normalized_feature_output_format,
+            output_warnings=output_warnings,
         )
         return FoldResult.model_validate(output)
 
@@ -2006,7 +2191,7 @@ def refua_fold(
 
 @mcp.tool()
 def refua_affinity(
-    entities: list[EntitySpec],
+    entities: list[EntitySpec | str] | str,
     *,
     name: str = "complex",
     base_dir: str | None = None,
@@ -2017,7 +2202,8 @@ def refua_affinity(
 ) -> AffinityResultResponse | QueuedJobResponse:
     """Run affinity-only predictions with strict typed inputs."""
 
-    entities_payload = _entities_to_payload(entities)
+    normalized_entities = _normalize_entities_arg(entities)
+    entities_payload = _entities_to_payload(normalized_entities)
     boltz_payload = _model_dict(boltz)
     admet_payload = _normalize_admet_arg(admet)
     affinity_payload: bool | dict[str, Any] = (
@@ -2053,12 +2239,12 @@ def refua_affinity(
 
 @mcp.tool()
 def refua_antibody_design(
-    antibody: AntibodyEntity,
+    antibody: AntibodyEntity | str,
     *,
-    context_entities: list[ContextEntitySpec] | None = None,
+    context_entities: list[ContextEntitySpec | str] | str | None = None,
     name: str = "antibody_design",
     base_dir: str | None = None,
-    constraints: list[ConstraintSpec] | None = None,
+    constraints: list[ConstraintSpec | str] | str | None = None,
     affinity: AffinityArg = None,
     run_boltz: bool | None = None,
     run_boltzgen: bool | None = None,
@@ -2066,18 +2252,38 @@ def refua_antibody_design(
     boltzgen: BoltzGenOptions | None = None,
     admet: AdmetArg = None,
     structure_output_path: str | None = None,
-    structure_output_format: Literal["cif", "bcif"] | None = None,
+    structure_output_format: StructureOutputFormatArg = None,
     return_mmcif: bool = False,
     return_bcif_base64: bool = False,
     feature_output_path: str | None = None,
-    feature_output_format: Literal["torch", "npz"] | None = None,
+    feature_output_format: FeatureOutputFormatArg = None,
+    allow_exploratory_run: bool = False,
     async_mode: bool = False,
 ) -> FoldResult | QueuedJobResponse:
     """Design/fold with an explicit antibody entrypoint plus optional context entities."""
 
-    merged_entities: list[EntitySpec] = [*(context_entities or []), antibody]
+    _enforce_non_exploratory_execution(
+        name,
+        allow_exploratory_run=allow_exploratory_run,
+    )
+    antibody_entity = _normalize_antibody_arg(antibody)
+    context_entity_list = _normalize_context_entities_arg(context_entities)
+    normalized_constraints = _normalize_constraints_arg(constraints)
+    (
+        normalized_structure_output_path,
+        normalized_structure_output_format,
+        normalized_feature_output_path,
+        normalized_feature_output_format,
+        output_warnings,
+    ) = _normalize_output_requests(
+        structure_output_path=structure_output_path,
+        structure_output_format=structure_output_format,
+        feature_output_path=feature_output_path,
+        feature_output_format=feature_output_format,
+    )
+    merged_entities: list[EntitySpec] = [*(context_entity_list or []), antibody_entity]
     entities_payload = _entities_to_payload(merged_entities)
-    constraints_payload = _constraints_to_payload(constraints)
+    constraints_payload = _constraints_to_payload(normalized_constraints)
     affinity_payload = _normalize_affinity_arg(affinity)
     boltz_payload = _model_dict(boltz)
     boltzgen_payload = _model_dict(boltzgen)
@@ -2096,12 +2302,13 @@ def refua_antibody_design(
             boltz=boltz_payload,
             boltzgen=boltzgen_payload,
             admet=admet_payload,
-            structure_output_path=structure_output_path,
-            structure_output_format=structure_output_format,
+            structure_output_path=normalized_structure_output_path,
+            structure_output_format=normalized_structure_output_format,
             return_mmcif=return_mmcif,
             return_bcif_base64=return_bcif_base64,
-            feature_output_path=feature_output_path,
-            feature_output_format=feature_output_format,
+            feature_output_path=normalized_feature_output_path,
+            feature_output_format=normalized_feature_output_format,
+            output_warnings=output_warnings,
         )
         return FoldResult.model_validate(output)
 
@@ -2112,12 +2319,12 @@ def refua_antibody_design(
 
 @mcp.tool()
 def refua_validate_spec(
-    entities: list[EntitySpec],
+    entities: list[EntitySpec | str] | str,
     *,
     action: Literal["fold", "affinity"] = "fold",
     name: str = "complex",
     base_dir: str | None = None,
-    constraints: list[ConstraintSpec] | None = None,
+    constraints: list[ConstraintSpec | str] | str | None = None,
     affinity: AffinityArg = None,
     run_boltz: bool | None = None,
     run_boltzgen: bool | None = None,
@@ -2125,15 +2332,29 @@ def refua_validate_spec(
     boltzgen: BoltzGenOptions | None = None,
     admet: AdmetArg = None,
     structure_output_path: str | None = None,
-    structure_output_format: Literal["cif", "bcif"] | None = None,
+    structure_output_format: StructureOutputFormatArg = None,
     feature_output_path: str | None = None,
-    feature_output_format: Literal["torch", "npz"] | None = None,
+    feature_output_format: FeatureOutputFormatArg = None,
     deep_validate: bool = False,
 ) -> ValidateSpecResult:
     """Validate and normalize a request without running fold/affinity inference."""
 
-    entities_payload = _entities_to_payload(entities)
-    constraints_payload = _constraints_to_payload(constraints)
+    normalized_entities = _normalize_entities_arg(entities)
+    normalized_constraints = _normalize_constraints_arg(constraints)
+    (
+        normalized_structure_output_path,
+        normalized_structure_output_format,
+        normalized_feature_output_path,
+        normalized_feature_output_format,
+        output_warnings,
+    ) = _normalize_output_requests(
+        structure_output_path=structure_output_path,
+        structure_output_format=structure_output_format,
+        feature_output_path=feature_output_path,
+        feature_output_format=feature_output_format,
+    )
+    entities_payload = _entities_to_payload(normalized_entities)
+    constraints_payload = _constraints_to_payload(normalized_constraints)
     affinity_payload = _normalize_affinity_arg(affinity)
     boltz_payload = _model_dict(boltz)
     boltzgen_payload = _model_dict(boltzgen)
@@ -2154,13 +2375,19 @@ def refua_validate_spec(
         run_boltzgen=run_boltzgen,
     )
 
-    if structure_output_path or structure_output_format:
-        _resolve_output_format(structure_output_path, structure_output_format)
-    if feature_output_path:
-        _resolve_feature_output_format(feature_output_path, feature_output_format)
+    if normalized_structure_output_path or normalized_structure_output_format:
+        _resolve_output_format(
+            normalized_structure_output_path,
+            normalized_structure_output_format,
+        )
+    if normalized_feature_output_path:
+        _resolve_feature_output_format(
+            normalized_feature_output_path,
+            normalized_feature_output_format,
+        )
 
-    warnings: list[str] = []
-    if feature_output_format and not feature_output_path:
+    warnings: list[str] = list(output_warnings)
+    if normalized_feature_output_format and not normalized_feature_output_path:
         warnings.append(
             "feature_output_format is ignored unless feature_output_path is provided."
         )
@@ -2218,10 +2445,10 @@ def refua_validate_spec(
             "boltz": boltz_payload,
             "boltzgen": boltzgen_payload,
             "admet": admet_payload,
-            "structure_output_path": structure_output_path,
-            "structure_output_format": structure_output_format,
-            "feature_output_path": feature_output_path,
-            "feature_output_format": feature_output_format,
+            "structure_output_path": normalized_structure_output_path,
+            "structure_output_format": normalized_structure_output_format,
+            "feature_output_path": normalized_feature_output_path,
+            "feature_output_format": normalized_feature_output_format,
             "deep_validate": deep_validate,
         }
     )
