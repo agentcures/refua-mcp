@@ -1,6 +1,6 @@
 # Refua MCP Server
 
-MCP server exposing Refua's unified Complex API for Boltz2 folding/affinity and BoltzGen design workflows.
+MCP server exposing strict, typed Refua tools for Boltz2 folding/affinity and BoltzGen design workflows.
 
 ## Install
 
@@ -65,15 +65,41 @@ startup_timeout_sec = 30
 
 ## Tools
 
-- `refua_complex`: run a unified Complex spec with `action="fold"` (default) or `action="affinity"`. Supports `protein|dna|rna|binder|peptide|antibody|ligand|file` entities. Optionally run ADMET for SMILES ligands via `admet` (auto by default when available).
-- `refua_job`: check status for background jobs and optionally return results.
-- `refua_admet_profile` (optional): run model-based ADMET predictions for SMILES strings (only available when `refua[admet]` is installed).
+- `refua_validate_spec`: validate and normalize a request without running folding/affinity.
+- `refua_fold`: run fold/design workflows with typed entities and constraints.
+- `refua_affinity`: run affinity-only predictions.
+- `refua_antibody_design`: focused antibody entrypoint (`antibody` + optional `context_entities`).
+- `refua_job`: check status/results for background jobs.
+- `refua_admet_profile` (optional): run model-based ADMET predictions for SMILES strings (requires `refua[admet]`).
 
-Example (fold a protein + ligand with optional affinity):
+All major tools expose strict JSON schemas, including discriminated entity unions by `type` and typed output schemas.
+
+## Resources And Templates
+
+- `refua://recipes/index` (resource): lists canonical recipe names.
+- `refua://recipes/{recipe_name}` (resource template): returns concrete tool/args examples.
+
+Recipe names:
+- `fold_protein_ligand`
+- `affinity_only`
+- `antibody_design`
+
+## Workflow
+
+Recommended call sequence:
+
+1. Read `refua://recipes/index` and optionally a recipe template.
+2. Call `refua_validate_spec` to catch schema/logic issues before expensive runs (`deep_validate=true` for asset-backed construction checks).
+3. Execute `refua_fold`, `refua_affinity`, or `refua_antibody_design`.
+4. For long runs, set `async_mode=true` and poll `refua_job`.
+
+## Examples
+
+Fold protein + ligand with optional affinity:
 
 ```json
 {
-  "tool": "refua_complex",
+  "tool": "refua_fold",
   "args": {
     "name": "protein_ligand",
     "entities": [
@@ -89,7 +115,58 @@ Example (fold a protein + ligand with optional affinity):
 }
 ```
 
-Example (ADMET predictions):
+Affinity-only:
+
+```json
+{
+  "tool": "refua_affinity",
+  "args": {
+    "name": "protein_ligand_affinity",
+    "entities": [
+      {"type": "protein", "id": "A", "sequence": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ"},
+      {"type": "ligand", "id": "lig", "smiles": "CCO"}
+    ],
+    "binder": "lig"
+  }
+}
+```
+
+Antibody-focused design:
+
+```json
+{
+  "tool": "refua_antibody_design",
+  "args": {
+    "name": "ab_design",
+    "antibody": {
+      "type": "antibody",
+      "ids": ["H", "L"],
+      "heavy_cdr_lengths": [12, 10, 14],
+      "light_cdr_lengths": [10, 9, 9]
+    },
+    "context_entities": [
+      {"type": "protein", "id": "A", "sequence": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ"}
+    ]
+  }
+}
+```
+
+Validate only (no run):
+
+```json
+{
+  "tool": "refua_validate_spec",
+  "args": {
+    "action": "fold",
+    "entities": [
+      {"type": "protein", "id": "A", "sequence": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ"},
+      {"type": "ligand", "id": "lig", "smiles": "CCO"}
+    ]
+  }
+}
+```
+
+ADMET predictions:
 
 ```json
 {
@@ -101,34 +178,16 @@ Example (ADMET predictions):
 }
 ```
 
-Example (antibody helper + peptide helper):
-
-```json
-{
-  "tool": "refua_complex",
-  "args": {
-    "name": "design_helpers",
-    "entities": [
-      {"type": "protein", "id": "A", "sequence": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ"},
-      {"type": "antibody", "ids": ["H", "L"], "heavy_cdr_lengths": [12, 10, 14], "light_cdr_lengths": [10, 9, 9]},
-      {"type": "peptide", "id": "P", "segment_lengths": [10, 6, 3], "disulfide": true}
-    ]
-  }
-}
-```
-
 Note: DNA/RNA entities are supported for Boltz2 folding only (BoltzGen does not accept DNA/RNA entities).
 
 ## Long-Running Jobs
 
-For runs that exceed the tool-call timeout, set `async_mode=true` and poll the job.
-Folding (`action="fold"`) can take minutes depending on inputs and hardware, so poll
-sparingly (for example, every 10-30 seconds with backoff) or follow
-`recommended_poll_seconds` from `refua_job`.
+For runs that exceed the tool-call timeout, set `async_mode=true` and poll sparingly
+(for example every 30-120 seconds) or follow `recommended_poll_seconds` from `refua_job`.
 
 ```json
 {
-  "tool": "refua_complex",
+  "tool": "refua_fold",
   "args": {
     "async_mode": true,
     "entities": [...]
@@ -136,7 +195,7 @@ sparingly (for example, every 10-30 seconds with backoff) or follow
 }
 ```
 
-Then poll with:
+Then poll:
 
 ```json
 {
@@ -148,7 +207,28 @@ Then poll with:
 ```
 
 For queued/running jobs, the response includes `recommended_poll_seconds` plus queue
-and estimate metadata (`queue_position` = jobs ahead, `queue_depth` = queued jobs,
-`average_runtime_seconds`, `estimated_start_seconds`, `estimated_remaining_seconds`)
-to help clients back off.
-Set `include_result=true` once the job is complete to fetch the output.
+and estimate metadata (`queue_position`, `queue_depth`, `average_runtime_seconds`,
+`estimated_start_seconds`, `estimated_remaining_seconds`).
+Set `include_result=true` once complete to fetch results.
+
+Long-poll support:
+
+```json
+{
+  "tool": "refua_job",
+  "args": {
+    "job_id": "...",
+    "wait_for_terminal_seconds": 300,
+    "include_result": true
+  }
+}
+```
+
+## Experimental MCP Tasks
+
+This server enables MCP experimental task support (`tasks/get`, `tasks/result`,
+`tasks/list`, `tasks/cancel`) and advertises task execution support for
+`refua_fold`, `refua_affinity`, `refua_antibody_design`, and `refua_admet_profile`.
+
+If your client supports task-augmented tool calls, prefer tasks for long-running
+operations. Otherwise, continue with `async_mode=true` + `refua_job`.
