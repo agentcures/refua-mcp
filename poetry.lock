@@ -3696,14 +3696,14 @@ typing-extensions = {version = ">=4.4.0", markers = "python_version < \"3.13\""}
 
 [[package]]
 name = "refua"
-version = "0.4.0"
+version = "0.5.0"
 description = "Unified drug discovery ML toolkit"
 optional = false
 python-versions = "<3.15,>=3.11"
 groups = ["main"]
 files = [
-    {file = "refua-0.4.0-py3-none-any.whl", hash = "sha256:f542338e7c68bb19bcda2109229e191490802b5d09dbc40c0acc68c29d4af563"},
-    {file = "refua-0.4.0.tar.gz", hash = "sha256:3318f7371b0019e9d378b2a895f7e82d2170698d17659750d3a5daf7d35a6fb4"},
+    {file = "refua-0.5.0-py3-none-any.whl", hash = "sha256:a3782f6d6dfca10003892bc2a2f31af242b5e0efd8fa6cccb7cdc5ed6627611e"},
+    {file = "refua-0.5.0.tar.gz", hash = "sha256:55927c42a4b551a280915e9d9cfa8d5ba2faab0d0d3f5467cecbc627c581ad8d"},
 ]
 
 [package.dependencies]
@@ -4692,4 +4692,4 @@ test = ["pytest"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.14"
-content-hash = "48fc1157d6c93dc72786bebb1f52d56dec007c8319388bafca300b17e8fb6cc9"
+content-hash = "13a2815bfc6e701bf609eeb7ddb3de184e2e54e9a464533842075b40579e4418"
