@@ -324,6 +324,35 @@ def _coerce_chain_ids(value: Any | None) -> str | tuple[str, ...] | None:
     raise ValueError("Chain id must be a string or list of strings.")
 
 
+def _coerce_triplet(
+    value: Any,
+    *,
+    field: str,
+) -> tuple[int, int, int]:
+    values: list[Any]
+    if isinstance(value, str):
+        values = [part.strip() for part in value.split(",") if part.strip()]
+    elif isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        raise ValueError(
+            f"{field} must be a 3-item list/tuple or comma-separated string."
+        )
+
+    if len(values) != 3:
+        raise ValueError(f"{field} must contain exactly 3 values.")
+    try:
+        first = int(values[0])
+        second = int(values[1])
+        third = int(values[2])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} values must be integers.") from exc
+    normalized = (first, second, third)
+    if any(item < 1 for item in normalized):
+        raise ValueError(f"{field} values must be >= 1.")
+    return normalized
+
+
 def _resolve_entity_ids(entity: Mapping[str, Any]) -> str | tuple[str, ...] | None:
     if "id" in entity:
         return _coerce_chain_ids(entity.get("id"))
@@ -380,6 +409,48 @@ def _make_ligand(
     return SmallMolecule.from_mol(mol, name=str(ccd))
 
 
+def _make_binder(
+    *,
+    spec: Any = None,
+    length: int | None = None,
+    ids: Any = None,
+    binding_types: Any = None,
+    secondary_structure: Any = None,
+    cyclic: bool = False,
+    template_values: Mapping[str, Any] | None = None,
+) -> Any:
+    from refua import Binder
+
+    binder_kwargs: dict[str, Any] = {
+        "spec": spec,
+        "length": length,
+        "ids": ids,
+        "binding_types": binding_types,
+        "secondary_structure": secondary_structure,
+        "cyclic": cyclic,
+    }
+    if template_values is not None:
+        binder_kwargs["template_values"] = template_values
+
+    try:
+        return Binder(**binder_kwargs)
+    except TypeError as exc:
+        if template_values is not None and "template_values" in str(exc):
+            raise ValueError("Binder template_values requires refua>=0.5.0.") from exc
+        raise
+
+
+def _get_binder_designs() -> Any:
+    import refua as refua_pkg
+
+    binder_designs = getattr(refua_pkg, "BinderDesigns", None)
+    if binder_designs is None:
+        raise ValueError(
+            "peptide and antibody entities require refua>=0.5.0 (BinderDesigns)."
+        )
+    return binder_designs
+
+
 def _build_complex_from_spec(
     *,
     name: str,
@@ -387,7 +458,7 @@ def _build_complex_from_spec(
     entities: list[dict[str, Any]],
     boltz_mol_dir: Path | None,
 ) -> tuple[Complex, dict[str, str], bool, bool]:
-    from refua import Binder, Complex, DNA, Protein, RNA
+    from refua import Complex, DNA, Protein, RNA
 
     if not entities:
         raise ValueError("entities must include at least one entity spec.")
@@ -471,15 +542,152 @@ def _build_complex_from_spec(
             if length is not None:
                 length = int(length)
             complex_spec.add(
-                Binder(
+                _make_binder(
                     spec=spec,
                     length=length,
+                    template_values=entity.get("template_values"),
                     ids=ids,
                     binding_types=entity.get("binding_types"),
                     secondary_structure=entity.get("secondary_structure"),
                     cyclic=bool(entity.get("cyclic", False)),
                 )
             )
+            has_boltzgen = True
+            continue
+
+        if entity_type == "peptide":
+            ids = _resolve_entity_ids(entity)
+            common_kwargs: dict[str, Any] = {
+                "binding_types": entity.get("binding_types"),
+                "secondary_structure": entity.get("secondary_structure"),
+            }
+            if ids is not None:
+                common_kwargs["ids"] = ids
+
+            spec = entity.get("spec")
+            if spec is None:
+                spec = entity.get("sequence")
+            if spec is not None:
+                length = entity.get("length")
+                if length is not None:
+                    length = int(length)
+                cyclic = (
+                    bool(entity.get("cyclic")) if "cyclic" in entity else bool(False)
+                )
+                peptide_binder = _make_binder(
+                    spec=spec,
+                    length=length,
+                    template_values=entity.get("template_values"),
+                    cyclic=cyclic,
+                    **common_kwargs,
+                )
+            elif "segment_lengths" in entity or bool(entity.get("disulfide")):
+                disulfide_kwargs = dict(common_kwargs)
+                if "cyclic" in entity:
+                    disulfide_kwargs["cyclic"] = bool(entity.get("cyclic"))
+                if "segment_lengths" in entity:
+                    disulfide_kwargs["segment_lengths"] = _coerce_triplet(
+                        entity["segment_lengths"],
+                        field="segment_lengths",
+                    )
+                peptide_binder = _get_binder_designs().disulfide_peptide(
+                    **disulfide_kwargs
+                )
+            else:
+                peptide_kwargs = dict(common_kwargs)
+                if "cyclic" in entity:
+                    peptide_kwargs["cyclic"] = bool(entity.get("cyclic"))
+                peptide_kwargs["length"] = int(entity.get("length", 12))
+                peptide_binder = _get_binder_designs().peptide(**peptide_kwargs)
+
+            complex_spec.add(peptide_binder)
+            has_boltzgen = True
+            continue
+
+        if entity_type == "antibody":
+            ids = _resolve_entity_ids(entity)
+            antibody_kwargs: dict[str, Any] = {}
+
+            if ids is not None:
+                if isinstance(ids, str):
+                    raise ValueError(
+                        "Antibody entity ids must include exactly two ids (heavy, light)."
+                    )
+                if len(ids) != 2:
+                    raise ValueError(
+                        "Antibody entity ids must include exactly two ids (heavy, light)."
+                    )
+                antibody_kwargs["heavy_id"] = ids[0]
+                antibody_kwargs["light_id"] = ids[1]
+            else:
+                heavy_id = entity.get("heavy_id")
+                light_id = entity.get("light_id")
+                if heavy_id is not None:
+                    antibody_kwargs["heavy_id"] = str(heavy_id)
+                if light_id is not None:
+                    antibody_kwargs["light_id"] = str(light_id)
+
+            if "heavy_cdr_lengths" in entity:
+                antibody_kwargs["heavy_cdr_lengths"] = _coerce_triplet(
+                    entity["heavy_cdr_lengths"],
+                    field="heavy_cdr_lengths",
+                )
+            if "light_cdr_lengths" in entity:
+                antibody_kwargs["light_cdr_lengths"] = _coerce_triplet(
+                    entity["light_cdr_lengths"],
+                    field="light_cdr_lengths",
+                )
+            if "heavy_binding_types" in entity:
+                antibody_kwargs["heavy_binding_types"] = entity.get(
+                    "heavy_binding_types"
+                )
+            if "light_binding_types" in entity:
+                antibody_kwargs["light_binding_types"] = entity.get(
+                    "light_binding_types"
+                )
+            if "heavy_secondary_structure" in entity:
+                antibody_kwargs["heavy_secondary_structure"] = entity.get(
+                    "heavy_secondary_structure"
+                )
+            if "light_secondary_structure" in entity:
+                antibody_kwargs["light_secondary_structure"] = entity.get(
+                    "light_secondary_structure"
+                )
+            if "heavy_cyclic" in entity:
+                antibody_kwargs["heavy_cyclic"] = bool(entity.get("heavy_cyclic"))
+            if "light_cyclic" in entity:
+                antibody_kwargs["light_cyclic"] = bool(entity.get("light_cyclic"))
+
+            antibody_pair = _get_binder_designs().antibody(**antibody_kwargs)
+
+            heavy_spec = entity.get("heavy_spec", entity.get("heavy_sequence"))
+            light_spec = entity.get("light_spec", entity.get("light_sequence"))
+
+            if heavy_spec is not None:
+                heavy_binder = _make_binder(
+                    spec=heavy_spec,
+                    template_values=entity.get("heavy_template_values"),
+                    ids=antibody_pair.heavy.ids,
+                    binding_types=antibody_pair.heavy.binding_types,
+                    secondary_structure=antibody_pair.heavy.secondary_structure,
+                    cyclic=antibody_pair.heavy.cyclic,
+                )
+            else:
+                heavy_binder = antibody_pair.heavy
+
+            if light_spec is not None:
+                light_binder = _make_binder(
+                    spec=light_spec,
+                    template_values=entity.get("light_template_values"),
+                    ids=antibody_pair.light.ids,
+                    binding_types=antibody_pair.light.binding_types,
+                    secondary_structure=antibody_pair.light.secondary_structure,
+                    cyclic=antibody_pair.light.cyclic,
+                )
+            else:
+                light_binder = antibody_pair.light
+
+            complex_spec.add(heavy_binder, light_binder)
             has_boltzgen = True
             continue
 
@@ -830,11 +1038,17 @@ def refua_complex(
     """Run a unified Refua Complex spec.
 
     entities: list of entity dicts with keys:
-      - type: protein | dna | rna | binder | ligand | file
+      - type: protein | dna | rna | binder | peptide | antibody | ligand | file
       - protein: sequence (required), id/ids, modifications, msa_a3m, binding_types,
         secondary_structure, cyclic
       - dna/rna: sequence (required), id/ids, modifications, cyclic
-      - binder: spec or length (required), id/ids, binding_types, secondary_structure, cyclic
+      - binder: spec or length (required), id/ids, binding_types, secondary_structure,
+        cyclic, template_values
+      - peptide: peptide design helper. Supports length, segment_lengths/disulfide,
+        spec/sequence overrides, id/ids, binding_types, secondary_structure, cyclic.
+      - antibody: paired heavy/light design helper. Supports heavy/light CDR lengths,
+        heavy_id/light_id (or ids=[heavy, light]), heavy/light binding and secondary
+        structure controls, and optional heavy/light spec overrides.
       - ligand: smiles or ccd (required), optional id alias (maps to L1/L2 order)
       - file: path (required) plus include/exclude/binding_types/etc.
 
@@ -875,7 +1089,9 @@ def refua_complex(
         has_boltz_entities = any(
             kind in {"protein", "dna", "rna", "ligand"} for kind in entity_types
         )
-        has_boltzgen_entities = any(kind in {"binder", "file"} for kind in entity_types)
+        has_boltzgen_entities = any(
+            kind in {"binder", "peptide", "antibody", "file"} for kind in entity_types
+        )
         wants_affinity = affinity not in (None, False)
 
         run_boltz_local = (

@@ -19,7 +19,15 @@ def _read_version_from_pyproject() -> str | None:
     return str(version)
 
 
+_local_version = _read_version_from_pyproject()
+
 try:
-    __version__ = _version("refua-mcp")
+    _installed_version = _version("refua-mcp")
 except PackageNotFoundError:
-    __version__ = _read_version_from_pyproject() or "unknown"
+    __version__ = _local_version or "unknown"
+else:
+    __version__ = (
+        _local_version
+        if _local_version is not None and _installed_version != _local_version
+        else _installed_version
+    )
