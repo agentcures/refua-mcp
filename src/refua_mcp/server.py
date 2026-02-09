@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import json
 import statistics
 import threading
 import time
@@ -12,9 +13,16 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Iterable, Literal, Mapping
 
+import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, TextContent
+from mcp.types import TaskExecutionMode
+from mcp.types import TasksCallCapability
+from mcp.types import Tool as McpTool
+from mcp.types import ToolExecution
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 if TYPE_CHECKING:
     from refua import Boltz2, BoltzGen, Complex, SmallMolecule
@@ -23,14 +31,33 @@ else:
     Boltz2 = BoltzGen = Complex = SmallMolecule = Any
     AdmetPredictor = Any
 
-mcp = FastMCP("refua-mcp")
+SERVER_INSTRUCTIONS = """
+Use the typed Refua tools directly instead of speculative probing.
+
+Recommended sequence:
+1) Read recipe resources (`refua://recipes/index` and `refua://recipes/{recipe_name}`)
+   for canonical call shapes.
+2) Call `refua_validate_spec` to normalize/validate before expensive work.
+3) Execute with the focused tool:
+   - `refua_fold` for structure/design folds
+   - `refua_affinity` for affinity-only predictions
+   - `refua_antibody_design` for antibody-heavy workflows
+4) For long runs, set `async_mode=true` and poll `refua_job` using
+   `recommended_poll_seconds` or `wait_for_terminal_seconds`.
+"""
+
+mcp = FastMCP("refua-mcp", instructions=SERVER_INSTRUCTIONS)
 
 DEFAULT_BOLTZ_CACHE = str(Path("~/.boltz").expanduser())
 JOB_HISTORY_LIMIT = 100
 JOB_MAX_WORKERS = 1
-POLL_MIN_SECONDS = 10
-POLL_MAX_SECONDS = 30
-POLL_FRACTION = 0.2
+POLL_MIN_SECONDS = 30
+POLL_MAX_SECONDS = 120
+POLL_QUEUE_STEP_SECONDS = 15
+POLL_FRACTION = 0.35
+LONG_POLL_MAX_WAIT_SECONDS = 900.0
+LONG_POLL_MIN_SLEEP_SECONDS = 5.0
+LONG_POLL_MAX_SLEEP_SECONDS = 120.0
 ADMET_DEPENDENCIES = ("transformers", "huggingface_hub")
 
 
@@ -43,6 +70,330 @@ def _admet_available() -> bool:
 
 
 _ADMET_AVAILABLE = _admet_available()
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ChainEntitySpec(StrictModel):
+    id: str | None = None
+    ids: list[str] | tuple[str, ...] | None = None
+
+    @model_validator(mode="after")
+    def _validate_id_fields(self) -> "ChainEntitySpec":
+        if self.id is not None and self.ids is not None:
+            raise ValueError("Use either id or ids, not both.")
+        if self.ids is not None and len(self.ids) == 0:
+            raise ValueError("ids cannot be empty.")
+        return self
+
+
+class ModificationSpec(StrictModel):
+    position: int
+    ccd: str
+
+
+class ProteinEntity(ChainEntitySpec):
+    type: Literal["protein"]
+    sequence: str
+    modifications: list[ModificationSpec | tuple[int, str]] = Field(
+        default_factory=list
+    )
+    msa_a3m: str | None = None
+    msa_taxonomy: str | None = None
+    msa_max_seqs: int | None = None
+    binding_types: Any | None = None
+    secondary_structure: Any | None = None
+    cyclic: bool = False
+
+
+class DNAEntity(ChainEntitySpec):
+    type: Literal["dna"]
+    sequence: str
+    modifications: list[ModificationSpec | tuple[int, str]] = Field(
+        default_factory=list
+    )
+    cyclic: bool = False
+
+
+class RNAEntity(ChainEntitySpec):
+    type: Literal["rna"]
+    sequence: str
+    modifications: list[ModificationSpec | tuple[int, str]] = Field(
+        default_factory=list
+    )
+    cyclic: bool = False
+
+
+class BinderEntity(ChainEntitySpec):
+    type: Literal["binder"]
+    spec: str | None = None
+    sequence: str | None = None
+    length: int | None = None
+    binding_types: Any | None = None
+    secondary_structure: Any | None = None
+    cyclic: bool = False
+    template_values: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _validate_binder_input(self) -> "BinderEntity":
+        if self.length is not None and self.length < 1:
+            raise ValueError("binder length must be >= 1.")
+        if self.spec is None and self.sequence is None and self.length is None:
+            raise ValueError(
+                "binder requires at least one of spec, sequence, or length."
+            )
+        return self
+
+
+class PeptideEntity(ChainEntitySpec):
+    type: Literal["peptide"]
+    spec: str | None = None
+    sequence: str | None = None
+    length: int | None = None
+    segment_lengths: tuple[int, int, int] | None = None
+    disulfide: bool = False
+    binding_types: Any | None = None
+    secondary_structure: Any | None = None
+    cyclic: bool | None = None
+    template_values: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _validate_peptide_input(self) -> "PeptideEntity":
+        if self.length is not None and self.length < 1:
+            raise ValueError("peptide length must be >= 1.")
+        if self.segment_lengths is not None and any(
+            item < 1 for item in self.segment_lengths
+        ):
+            raise ValueError("segment_lengths values must be >= 1.")
+        return self
+
+
+class AntibodyEntity(StrictModel):
+    type: Literal["antibody"]
+    ids: list[str] | tuple[str, str] | None = None
+    heavy_id: str | None = None
+    light_id: str | None = None
+    heavy_cdr_lengths: tuple[int, int, int] | None = None
+    light_cdr_lengths: tuple[int, int, int] | None = None
+    heavy_binding_types: Any | None = None
+    light_binding_types: Any | None = None
+    heavy_secondary_structure: Any | None = None
+    light_secondary_structure: Any | None = None
+    heavy_cyclic: bool | None = None
+    light_cyclic: bool | None = None
+    heavy_spec: str | None = None
+    heavy_sequence: str | None = None
+    light_spec: str | None = None
+    light_sequence: str | None = None
+    heavy_template_values: dict[str, Any] | None = None
+    light_template_values: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _validate_antibody_input(self) -> "AntibodyEntity":
+        if self.ids is not None:
+            if len(self.ids) != 2:
+                raise ValueError("antibody ids must include exactly two values.")
+            if self.heavy_id is not None or self.light_id is not None:
+                raise ValueError("use either ids=[heavy,light] or heavy_id/light_id.")
+        for field_name in ("heavy_cdr_lengths", "light_cdr_lengths"):
+            value = getattr(self, field_name)
+            if value is not None and any(item < 1 for item in value):
+                raise ValueError(f"{field_name} values must be >= 1.")
+        return self
+
+
+class LigandEntity(ChainEntitySpec):
+    type: Literal["ligand"]
+    smiles: str | None = None
+    ccd: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_ligand_input(self) -> "LigandEntity":
+        if (self.smiles is None) == (self.ccd is None):
+            raise ValueError("ligand requires exactly one of smiles or ccd.")
+        if self.ids is not None and len(self.ids) != 1:
+            raise ValueError("ligand ids must contain exactly one value.")
+        return self
+
+
+class FileEntity(StrictModel):
+    type: Literal["file"]
+    path: str
+    include: Any | None = None
+    exclude: Any | None = None
+    include_proximity: Any | None = None
+    binding_types: Any | None = None
+    structure_groups: Any | None = None
+    design: Any | None = None
+    not_design: Any | None = None
+    secondary_structure: Any | None = None
+    design_insertions: Any | None = None
+    fuse: Any | None = None
+    msa: Any | None = None
+    use_assembly: Any | None = None
+    reset_res_index: Any | None = None
+    extra: dict[str, Any] = Field(default_factory=dict)
+
+
+EntitySpec = Annotated[
+    ProteinEntity
+    | DNAEntity
+    | RNAEntity
+    | BinderEntity
+    | PeptideEntity
+    | AntibodyEntity
+    | LigandEntity
+    | FileEntity,
+    Field(discriminator="type"),
+]
+
+ContextEntitySpec = Annotated[
+    ProteinEntity
+    | DNAEntity
+    | RNAEntity
+    | BinderEntity
+    | PeptideEntity
+    | LigandEntity
+    | FileEntity,
+    Field(discriminator="type"),
+]
+
+
+class BondConstraint(StrictModel):
+    type: Literal["bond"]
+    atom1: tuple[str, int, str]
+    atom2: tuple[str, int, str]
+
+
+class PocketConstraint(StrictModel):
+    type: Literal["pocket"]
+    binder: str
+    contacts: list[tuple[str, int]]
+    max_distance: float = 6.0
+    force: bool = False
+
+    @model_validator(mode="after")
+    def _validate_contacts(self) -> "PocketConstraint":
+        if not self.contacts:
+            raise ValueError("pocket constraints require at least one contact.")
+        return self
+
+
+class ContactConstraint(StrictModel):
+    type: Literal["contact"]
+    token1: tuple[str, int]
+    token2: tuple[str, int]
+    max_distance: float = 6.0
+    force: bool = False
+
+
+ConstraintSpec = Annotated[
+    BondConstraint | PocketConstraint | ContactConstraint,
+    Field(discriminator="type"),
+]
+
+
+class AffinityOptions(StrictModel):
+    binder: str | None = None
+
+
+class BoltzOptions(StrictModel):
+    cache_dir: str | None = None
+    device: str | None = None
+    auto_download: bool = True
+    use_kernels: bool = True
+    affinity_mw_correction: bool = True
+    predict_args: dict[str, Any] | None = None
+    affinity_predict_args: dict[str, Any] | None = None
+
+
+class BoltzGenOptions(StrictModel):
+    mol_dir: str | None = None
+    auto_download: bool = True
+    cache_dir: str | None = None
+    token: str | None = None
+    force_download: bool = False
+
+
+class AdmetOptions(StrictModel):
+    mode: Literal["auto", "on", "off"] | None = None
+    enabled: bool | None = None
+    ligands: str | list[str] | None = None
+    model_variant: str | None = None
+    max_new_tokens: int | None = None
+    include_scoring: bool | None = None
+    task_ids: list[str] | None = None
+
+
+AdmetArg = bool | Literal["auto", "on", "off"] | AdmetOptions | None
+AffinityArg = bool | AffinityOptions | None
+
+
+class AffinityResult(StrictModel):
+    ic50: float | None = None
+    binding_probability: float | None = None
+    ic50_1: float | None = None
+    binding_probability_1: float | None = None
+    ic50_2: float | None = None
+    binding_probability_2: float | None = None
+
+
+class StructureResult(StrictModel):
+    confidence_score: float
+    output_path: str | None = None
+    output_format: Literal["cif", "bcif"] | None = None
+    mmcif: str | None = None
+    bcif_base64: str | None = None
+
+
+class FeatureResult(StrictModel):
+    feature_keys: list[str]
+    feature_shapes: dict[str, list[int]]
+    output_path: str | None = None
+    output_format: Literal["torch", "npz"] | None = None
+
+
+class FoldResult(StrictModel):
+    name: str
+    backend: str
+    chain_ids: Any
+    binder_sequences: Any
+    ligand_id_map: dict[str, str] | None = None
+    admet: dict[str, Any] | None = None
+    affinity: AffinityResult | None = None
+    structure: StructureResult | None = None
+    features: FeatureResult | None = None
+
+
+class AffinityResultResponse(StrictModel):
+    name: str
+    binder: str | None = None
+    affinity: AffinityResult
+    ligand_id_map: dict[str, str] | None = None
+    admet: dict[str, Any] | None = None
+
+
+class QueuedJobResponse(StrictModel):
+    job_id: str
+    status: Literal["queued"] = "queued"
+
+
+class ValidationPlan(StrictModel):
+    action: Literal["fold", "affinity"]
+    run_boltz: bool
+    run_boltzgen: bool
+    entity_type_counts: dict[str, int]
+    ligand_id_map: dict[str, str]
+    smiles_ligand_ids: list[str]
+
+
+class ValidateSpecResult(StrictModel):
+    valid: Literal[True] = True
+    normalized_input: dict[str, Any]
+    execution_plan: ValidationPlan
+    warnings: list[str] = Field(default_factory=list)
 
 
 @dataclass
@@ -60,6 +411,12 @@ class JobRecord:
 _JOB_LOCK = threading.Lock()
 _JOB_STORE: OrderedDict[str, JobRecord] = OrderedDict()
 _JOB_EXECUTOR = ThreadPoolExecutor(max_workers=JOB_MAX_WORKERS)
+_TASK_SUPPORT_BY_TOOL: dict[str, TaskExecutionMode] = {
+    "refua_fold": "optional",
+    "refua_affinity": "optional",
+    "refua_antibody_design": "optional",
+    "refua_admet_profile": "optional",
+}
 
 
 def _clamp_seconds(value: float, minimum: int, maximum: int) -> int:
@@ -68,7 +425,10 @@ def _clamp_seconds(value: float, minimum: int, maximum: int) -> int:
 
 def _recommend_poll_seconds(estimate_seconds: float | None, queue_position: int) -> int:
     if estimate_seconds is None:
-        return min(POLL_MAX_SECONDS, POLL_MIN_SECONDS + queue_position * 5)
+        return min(
+            POLL_MAX_SECONDS,
+            POLL_MIN_SECONDS + queue_position * POLL_QUEUE_STEP_SECONDS,
+        )
     estimate_seconds = max(estimate_seconds, float(POLL_MIN_SECONDS))
     return _clamp_seconds(
         estimate_seconds * POLL_FRACTION,
@@ -100,6 +460,198 @@ def _queue_position_locked(job_id: str) -> int:
 
 def _queue_depth_locked() -> int:
     return sum(1 for job in _JOB_STORE.values() if job.status == "queued")
+
+
+def _task_support_mode(tool_name: str) -> TaskExecutionMode:
+    if tool_name == "refua_admet_profile" and not _ADMET_AVAILABLE:
+        return "forbidden"
+    return _TASK_SUPPORT_BY_TOOL.get(tool_name, "forbidden")
+
+
+def _normalize_task_tool_result(result: Any) -> CallToolResult:
+    if isinstance(result, BaseModel):
+        result = result.model_dump(mode="json")
+    if isinstance(result, CallToolResult):
+        return result
+    if isinstance(result, dict):
+        return CallToolResult(
+            content=[
+                TextContent(
+                    type="text",
+                    text=json.dumps(result, indent=2),
+                )
+            ],
+            structuredContent=result,
+            isError=False,
+        )
+    if isinstance(result, tuple) and len(result) == 2:
+        unstructured, structured = result
+        if not isinstance(structured, dict):
+            raise ValueError("Task tool tuple results require dict structured output.")
+        return CallToolResult(
+            content=list(unstructured),
+            structuredContent=structured,
+            isError=False,
+        )
+    if isinstance(result, str):
+        return CallToolResult(
+            content=[TextContent(type="text", text=result)],
+            isError=False,
+        )
+    if isinstance(result, Iterable):
+        return CallToolResult(content=list(result), isError=False)
+    raise ValueError(f"Unexpected task tool return type: {type(result).__name__}")
+
+
+def _coerce_tool_result_dict(result: Any) -> dict[str, Any]:
+    if isinstance(result, BaseModel):
+        return result.model_dump(mode="json")
+    if isinstance(result, dict):
+        return result
+    raise ValueError("Task-augmented tool runners must return dict-like output.")
+
+
+def _build_task_runner(
+    tool_name: str, arguments: Mapping[str, Any]
+) -> Callable[[], dict[str, Any]] | None:
+    kwargs = dict(arguments)
+    if tool_name in {"refua_fold", "refua_affinity", "refua_antibody_design"}:
+        # task-augmented execution already runs in background; avoid nested async jobs.
+        kwargs["async_mode"] = False
+        if tool_name == "refua_fold":
+            return lambda: _coerce_tool_result_dict(refua_fold(**kwargs))
+        if tool_name == "refua_affinity":
+            return lambda: _coerce_tool_result_dict(refua_affinity(**kwargs))
+        return lambda: _coerce_tool_result_dict(refua_antibody_design(**kwargs))
+    if tool_name == "refua_admet_profile" and _ADMET_AVAILABLE:
+        return lambda: refua_admet_profile(**kwargs)
+    return None
+
+
+def _long_poll_sleep_seconds(
+    snapshot: Mapping[str, Any], remaining_seconds: float
+) -> float:
+    suggested = float(snapshot.get("recommended_poll_seconds", POLL_MIN_SECONDS))
+    bounded = max(
+        LONG_POLL_MIN_SLEEP_SECONDS, min(LONG_POLL_MAX_SLEEP_SECONDS, suggested)
+    )
+    return min(remaining_seconds, bounded)
+
+
+def _poll_job_until_terminal(
+    job_id: str,
+    *,
+    include_result: bool,
+    wait_for_terminal_seconds: float,
+) -> dict[str, Any]:
+    capped_wait = max(
+        0.0, min(float(wait_for_terminal_seconds), LONG_POLL_MAX_WAIT_SECONDS)
+    )
+    deadline = time.time() + capped_wait
+    snapshot = _job_snapshot(job_id, include_result)
+    while snapshot["status"] in {"queued", "running"}:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(_long_poll_sleep_seconds(snapshot, remaining))
+        snapshot = _job_snapshot(job_id, include_result)
+    return snapshot
+
+
+async def _call_tool_with_task_support(
+    name: str,
+    arguments: dict[str, Any],
+) -> Any:
+    context = mcp.get_context()
+    request_context = context.request_context
+    experimental = request_context.experimental
+    task_mode = _task_support_mode(name)
+
+    if experimental is not None:
+        experimental.validate_task_mode(task_mode)
+
+    # Non task-augmented calls behave exactly like standard FastMCP tool execution.
+    if experimental is None or not experimental.is_task:
+        return await mcp._tool_manager.call_tool(
+            name,
+            arguments,
+            context=context,
+            convert_result=False,
+        )
+
+    runner = _build_task_runner(name, arguments)
+    if runner is None:
+        return CallToolResult(
+            content=[
+                TextContent(
+                    type="text",
+                    text=f"Task-augmented execution is not implemented for tool '{name}'.",
+                )
+            ],
+            isError=True,
+        )
+
+    async def work(task_context: Any) -> CallToolResult:
+        await task_context.update_status("queued")
+        job_id = _submit_job(name, runner)
+
+        while True:
+            snapshot = _job_snapshot(job_id, include_result=True)
+            status = str(snapshot["status"])
+
+            if status == "success":
+                return _normalize_task_tool_result(snapshot.get("result"))
+
+            if status == "error":
+                return CallToolResult(
+                    content=[
+                        TextContent(
+                            type="text",
+                            text=str(snapshot.get("error", "Task failed.")),
+                        )
+                    ],
+                    isError=True,
+                )
+
+            if status == "queued":
+                queue_position = snapshot.get("queue_position")
+                if queue_position is not None:
+                    await task_context.update_status(f"queued ({queue_position} ahead)")
+            elif status == "running":
+                eta = snapshot.get("estimated_remaining_seconds")
+                if isinstance(eta, (float, int)):
+                    await task_context.update_status(
+                        f"running (~{max(0, int(round(float(eta))))}s remaining)"
+                    )
+                else:
+                    await task_context.update_status("running")
+
+            await anyio.sleep(
+                _long_poll_sleep_seconds(snapshot, LONG_POLL_MAX_SLEEP_SECONDS),
+            )
+
+    return await experimental.run_task(
+        work,
+        model_immediate_response=f"{name} started in background task execution.",
+    )
+
+
+async def _list_tools_with_task_support() -> list[McpTool]:
+    tools = mcp._tool_manager.list_tools()
+    return [
+        McpTool(
+            name=info.name,
+            title=info.title,
+            description=info.description,
+            inputSchema=info.parameters,
+            outputSchema=info.output_schema,
+            annotations=info.annotations,
+            icons=info.icons,
+            _meta=info.meta,
+            execution=ToolExecution(taskSupport=_task_support_mode(info.name)),
+        )
+        for info in tools
+    ]
 
 
 @lru_cache(maxsize=4)
@@ -1013,329 +1565,793 @@ def _job_snapshot(job_id: str, include_result: bool) -> dict[str, Any]:
         return snapshot
 
 
-@mcp.tool()
-def refua_complex(
-    entities: list[dict[str, Any]],
-    *,
-    name: str = "complex",
-    base_dir: str | None = None,
-    constraints: list[dict[str, Any]] | None = None,
-    affinity: bool | dict[str, Any] | None = None,
-    action: str = "fold",
-    run_boltz: bool | None = None,
-    run_boltzgen: bool | None = None,
-    boltz: dict[str, Any] | None = None,
-    boltzgen: dict[str, Any] | None = None,
-    admet: bool | str | dict[str, Any] | None = None,
-    structure_output_path: str | None = None,
-    structure_output_format: str | None = None,
-    return_mmcif: bool = False,
-    return_bcif_base64: bool = False,
-    feature_output_path: str | None = None,
-    feature_output_format: str | None = None,
-    async_mode: bool = False,
-) -> dict[str, Any]:
-    """Run a unified Refua Complex spec.
+def _model_dict(value: BaseModel | Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, BaseModel):
+        return value.model_dump(exclude_none=True)
+    return dict(value)
 
-    entities: list of entity dicts with keys:
-      - type: protein | dna | rna | binder | peptide | antibody | ligand | file
-      - protein: sequence (required), id/ids, modifications, msa_a3m, binding_types,
-        secondary_structure, cyclic
-      - dna/rna: sequence (required), id/ids, modifications, cyclic
-      - binder: spec or length (required), id/ids, binding_types, secondary_structure,
-        cyclic, template_values
-      - peptide: peptide design helper. Supports length, segment_lengths/disulfide,
-        spec/sequence overrides, id/ids, binding_types, secondary_structure, cyclic.
-      - antibody: paired heavy/light design helper. Supports heavy/light CDR lengths,
-        heavy_id/light_id (or ids=[heavy, light]), heavy/light binding and secondary
-        structure controls, and optional heavy/light spec overrides.
-      - ligand: smiles or ccd (required), optional id alias (maps to L1/L2 order)
-      - file: path (required) plus include/exclude/binding_types/etc.
 
-    constraints: list of {type: bond|pocket|contact}. Ligand references use L1/L2
-    (or the provided ligand id alias). DNA/RNA entities are Boltz2-only.
-    action can be "fold" or "affinity".
-    admet: run optional ADMET predictions for ligand SMILES. Use true/"on" to
-    force, false/"off" to disable, or omit for auto (runs when SMILES ligands
-    are present and ADMET deps are installed). Dict options: mode, ligands,
-    model_variant, max_new_tokens, include_scoring, task_ids.
-    Folding can take minutes depending on inputs and hardware; use async_mode for
-    long runs and poll refua_job sparingly (for example, every 10-30 seconds) or
-    follow the recommended_poll_seconds returned by refua_job.
-    """
+def _entities_to_payload(entities: Iterable[Any]) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for entity in entities:
+        if isinstance(entity, BaseModel):
+            payload.append(entity.model_dump(exclude_none=True))
+        elif isinstance(entity, Mapping):
+            payload.append(dict(entity))
+        else:
+            raise ValueError("Each entity must be a dict or typed entity model.")
+    return payload
 
-    def run() -> dict[str, Any]:
-        action_value = str(action or "fold").lower()
-        if action_value not in {"fold", "affinity"}:
-            raise ValueError("action must be 'fold' or 'affinity'.")
 
-        boltz_opts = _parse_boltz_options(boltz)
-        boltzgen_opts = _parse_boltzgen_options(boltzgen)
-        admet_mode, admet_opts = _parse_admet_options(admet)
-
-        ligand_specs: list[dict[str, Any]] = []
-        ligand_index = 1
-        for item in entities:
-            if not isinstance(item, Mapping):
-                continue
-            if str(item.get("type", "")).lower() == "ligand":
-                ligand_id = f"L{ligand_index}"
-                ligand_index += 1
-                smiles = item.get("smiles")
-                if smiles is not None:
-                    ligand_specs.append({"ligand_id": ligand_id, "smiles": str(smiles)})
-
-        entity_types = [str(item.get("type", "")).lower() for item in entities]
-        has_boltz_entities = any(
-            kind in {"protein", "dna", "rna", "ligand"} for kind in entity_types
-        )
-        has_boltzgen_entities = any(
-            kind in {"binder", "peptide", "antibody", "file"} for kind in entity_types
-        )
-        wants_affinity = affinity not in (None, False)
-
-        run_boltz_local = (
-            bool(run_boltz)
-            if run_boltz is not None
-            else bool(has_boltz_entities or constraints or wants_affinity)
-        )
-        run_boltzgen_local = (
-            bool(run_boltzgen)
-            if run_boltzgen is not None
-            else bool(has_boltzgen_entities)
-        )
-
-        if action_value == "affinity":
-            run_boltz_local = True
-            run_boltzgen_local = False
-
-        if constraints and not run_boltz_local:
-            raise ValueError("constraints require run_boltz=true.")
-        if wants_affinity and not run_boltz_local and action_value == "fold":
-            raise ValueError("affinity requests require run_boltz=true.")
-
-        boltz_model = None
-        if run_boltz_local or action_value == "affinity":
-            boltz_model = _build_boltz2_from_options(boltz_opts)
-
-        has_ccd = any(
-            str(item.get("type", "")).lower() == "ligand"
-            and item.get("ccd") is not None
-            for item in entities
-        )
-        boltz_mol_dir = None
-        if has_ccd:
-            boltz_mol_dir = _resolve_boltz_mol_dir(boltz_model, boltz_opts)
-            if boltz_mol_dir is None or not boltz_mol_dir.exists():
-                raise FileNotFoundError(
-                    "CCD ligands require Boltz2 molecule assets. "
-                    "Set boltz.cache_dir or enable run_boltz with auto_download."
-                )
-
-        complex_spec, ligand_alias_map, _, _ = _build_complex_from_spec(
-            name=name,
-            base_dir=base_dir,
-            entities=entities,
-            boltz_mol_dir=boltz_mol_dir,
-        )
-
-        _apply_constraints(complex_spec, constraints, ligand_alias_map)
-
-        admet_output: dict[str, Any] | None = None
-        if admet_mode != "off":
-            has_smiles_ligands = bool(ligand_specs)
-            wants_admet = admet_mode == "on" or (
-                admet_mode == "auto" and has_smiles_ligands
+def _constraints_to_payload(
+    constraints: Iterable[Any] | None,
+) -> list[dict[str, Any]] | None:
+    if constraints is None:
+        return None
+    payload: list[dict[str, Any]] = []
+    for constraint in constraints:
+        if isinstance(constraint, BaseModel):
+            payload.append(constraint.model_dump(exclude_none=True))
+        elif isinstance(constraint, Mapping):
+            payload.append(dict(constraint))
+        else:
+            raise ValueError(
+                "Each constraint must be a dict or typed constraint model."
             )
-            if wants_admet:
-                if not _ADMET_AVAILABLE:
+    return payload
+
+
+def _normalize_affinity_arg(affinity: AffinityArg) -> bool | dict[str, Any] | None:
+    if isinstance(affinity, BaseModel):
+        return affinity.model_dump(exclude_none=True)
+    return affinity
+
+
+def _normalize_admet_arg(admet: AdmetArg) -> bool | str | dict[str, Any] | None:
+    if isinstance(admet, BaseModel):
+        return admet.model_dump(exclude_none=True)
+    return admet
+
+
+def _compact_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _analyze_entities(
+    entities: list[dict[str, Any]],
+) -> tuple[list[str], dict[str, int], list[dict[str, Any]], dict[str, str]]:
+    entity_types: list[str] = []
+    entity_type_counts: dict[str, int] = {}
+    ligand_specs: list[dict[str, Any]] = []
+    ligand_alias_map: dict[str, str] = {}
+
+    ligand_index = 1
+    for item in entities:
+        kind = str(item.get("type", "")).lower()
+        entity_types.append(kind)
+        entity_type_counts[kind] = entity_type_counts.get(kind, 0) + 1
+
+        if kind != "ligand":
+            continue
+
+        ligand_id = f"L{ligand_index}"
+        smiles = item.get("smiles")
+        if smiles is not None:
+            ligand_specs.append({"ligand_id": ligand_id, "smiles": str(smiles)})
+
+        alias_value = item.get("id", item.get("ids"))
+        if alias_value is not None:
+            if isinstance(alias_value, (list, tuple)):
+                if len(alias_value) != 1:
+                    raise ValueError("Ligand id must be a single string.")
+                alias = str(alias_value[0])
+            else:
+                alias = str(alias_value)
+            if alias.startswith("L") and alias[1:].isdigit() and alias != ligand_id:
+                raise ValueError(
+                    "Ligand id aliases cannot shadow unified ids. "
+                    "Omit the alias or use a non-L name."
+                )
+            if alias in ligand_alias_map:
+                raise ValueError(f"Duplicate ligand alias: {alias}")
+            ligand_alias_map[alias] = ligand_id
+
+        ligand_index += 1
+
+    return entity_types, entity_type_counts, ligand_specs, ligand_alias_map
+
+
+def _resolve_execution_modes(
+    *,
+    action: str,
+    entity_types: list[str],
+    constraints: list[dict[str, Any]] | None,
+    affinity: bool | dict[str, Any] | None,
+    run_boltz: bool | None,
+    run_boltzgen: bool | None,
+) -> tuple[Literal["fold", "affinity"], bool, bool]:
+    raw_action = str(action or "fold").lower()
+    if raw_action not in {"fold", "affinity"}:
+        raise ValueError("action must be 'fold' or 'affinity'.")
+    action_value: Literal["fold", "affinity"] = (
+        "affinity" if raw_action == "affinity" else "fold"
+    )
+
+    has_boltz_entities = any(
+        kind in {"protein", "dna", "rna", "ligand"} for kind in entity_types
+    )
+    has_boltzgen_entities = any(
+        kind in {"binder", "peptide", "antibody", "file"} for kind in entity_types
+    )
+    wants_affinity = affinity not in (None, False)
+
+    run_boltz_local = (
+        bool(run_boltz)
+        if run_boltz is not None
+        else bool(has_boltz_entities or constraints or wants_affinity)
+    )
+    run_boltzgen_local = (
+        bool(run_boltzgen) if run_boltzgen is not None else bool(has_boltzgen_entities)
+    )
+
+    if action_value == "affinity":
+        run_boltz_local = True
+        run_boltzgen_local = False
+
+    if constraints and not run_boltz_local:
+        raise ValueError("constraints require run_boltz=true.")
+    if wants_affinity and not run_boltz_local and action_value == "fold":
+        raise ValueError("affinity requests require run_boltz=true.")
+
+    return action_value, run_boltz_local, run_boltzgen_local
+
+
+def _affinity_to_dict(value: Any) -> dict[str, float | None]:
+    return {
+        "ic50": value.ic50,
+        "binding_probability": value.binding_probability,
+        "ic50_1": value.ic50_1,
+        "binding_probability_1": value.binding_probability_1,
+        "ic50_2": value.ic50_2,
+        "binding_probability_2": value.binding_probability_2,
+    }
+
+
+def _run_complex_operation(
+    *,
+    entities: list[dict[str, Any]],
+    name: str,
+    base_dir: str | None,
+    constraints: list[dict[str, Any]] | None,
+    affinity: bool | dict[str, Any] | None,
+    action: Literal["fold", "affinity"],
+    run_boltz: bool | None,
+    run_boltzgen: bool | None,
+    boltz: dict[str, Any] | None,
+    boltzgen: dict[str, Any] | None,
+    admet: bool | str | dict[str, Any] | None,
+    structure_output_path: str | None,
+    structure_output_format: str | None,
+    return_mmcif: bool,
+    return_bcif_base64: bool,
+    feature_output_path: str | None,
+    feature_output_format: str | None,
+) -> dict[str, Any]:
+    boltz_opts = _parse_boltz_options(boltz)
+    boltzgen_opts = _parse_boltzgen_options(boltzgen)
+    admet_mode, admet_opts = _parse_admet_options(admet)
+
+    entity_types, _, ligand_specs, _ = _analyze_entities(entities)
+    action_value, run_boltz_local, run_boltzgen_local = _resolve_execution_modes(
+        action=action,
+        entity_types=entity_types,
+        constraints=constraints,
+        affinity=affinity,
+        run_boltz=run_boltz,
+        run_boltzgen=run_boltzgen,
+    )
+
+    boltz_model = None
+    if run_boltz_local or action_value == "affinity":
+        boltz_model = _build_boltz2_from_options(boltz_opts)
+
+    has_ccd = any(
+        str(item.get("type", "")).lower() == "ligand" and item.get("ccd") is not None
+        for item in entities
+    )
+    boltz_mol_dir = None
+    if has_ccd:
+        boltz_mol_dir = _resolve_boltz_mol_dir(boltz_model, boltz_opts)
+        if boltz_mol_dir is None or not boltz_mol_dir.exists():
+            raise FileNotFoundError(
+                "CCD ligands require Boltz2 molecule assets. "
+                "Set boltz.cache_dir or enable run_boltz with auto_download."
+            )
+
+    complex_spec, ligand_alias_map, _, _ = _build_complex_from_spec(
+        name=name,
+        base_dir=base_dir,
+        entities=entities,
+        boltz_mol_dir=boltz_mol_dir,
+    )
+
+    _apply_constraints(complex_spec, constraints, ligand_alias_map)
+
+    admet_output: dict[str, Any] | None = None
+    if admet_mode != "off":
+        has_smiles_ligands = bool(ligand_specs)
+        wants_admet = admet_mode == "on" or (
+            admet_mode == "auto" and has_smiles_ligands
+        )
+        if wants_admet:
+            if not _ADMET_AVAILABLE:
+                if admet_mode == "on":
+                    raise ValueError(
+                        "ADMET requested but refua[admet] is not installed."
+                    )
+                admet_output = {
+                    "status": "unavailable",
+                    "reason": "Install refua[admet] to enable ADMET predictions.",
+                }
+            else:
+                requested = _normalize_admet_ligands(admet_opts.get("ligands"))
+                targets = _select_admet_ligands(
+                    ligand_specs,
+                    requested,
+                    ligand_alias_map,
+                )
+                if not targets:
                     if admet_mode == "on":
                         raise ValueError(
-                            "ADMET requested but refua[admet] is not installed."
+                            "ADMET requested but no SMILES ligands are available."
                         )
-                    admet_output = {
-                        "status": "unavailable",
-                        "reason": "Install refua[admet] to enable ADMET predictions.",
-                    }
                 else:
-                    requested = _normalize_admet_ligands(admet_opts.get("ligands"))
-                    targets = _select_admet_ligands(
-                        ligand_specs,
-                        requested,
-                        ligand_alias_map,
+                    normalized_tasks = _normalize_admet_task_ids(
+                        admet_opts.get("task_ids")
                     )
-                    if not targets:
-                        if admet_mode == "on":
-                            raise ValueError(
-                                "ADMET requested but no SMILES ligands are available."
-                            )
-                    else:
-                        normalized_tasks = _normalize_admet_task_ids(
-                            admet_opts.get("task_ids")
+                    model_variant = str(admet_opts.get("model_variant", "9b-chat"))
+                    max_new_tokens = int(admet_opts.get("max_new_tokens", 8))
+                    include_scoring = bool(admet_opts.get("include_scoring", True))
+                    results = []
+                    for target in targets:
+                        profile = _admet_analyze(
+                            smiles=target["smiles"],
+                            model_variant=model_variant,
+                            max_new_tokens=max_new_tokens,
+                            include_scoring=include_scoring,
+                            task_ids=normalized_tasks,
                         )
-                        model_variant = str(admet_opts.get("model_variant", "9b-chat"))
-                        max_new_tokens = int(admet_opts.get("max_new_tokens", 8))
-                        include_scoring = bool(admet_opts.get("include_scoring", True))
-                        results = []
-                        for target in targets:
-                            profile = _admet_analyze(
-                                smiles=target["smiles"],
-                                model_variant=model_variant,
-                                max_new_tokens=max_new_tokens,
-                                include_scoring=include_scoring,
-                                task_ids=normalized_tasks,
-                            )
-                            profile["ligand_id"] = target["ligand_id"]
-                            results.append(profile)
-                        admet_output = {"status": "success", "results": results}
+                        profile["ligand_id"] = target["ligand_id"]
+                        results.append(profile)
+                    admet_output = {"status": "success", "results": results}
 
-        affinity_requested, affinity_binder = _resolve_affinity_request(
-            affinity, ligand_alias_map
-        )
+    affinity_requested, affinity_binder = _resolve_affinity_request(
+        affinity, ligand_alias_map
+    )
 
-        if action_value == "affinity":
-            affinity_result = complex_spec.affinity(
-                binder=affinity_binder,
-                boltz=boltz_model,
-            )
-            output: dict[str, Any] = {
-                "name": name,
-                "binder": affinity_binder,
-                "affinity": {
-                    "ic50": affinity_result.ic50,
-                    "binding_probability": affinity_result.binding_probability,
-                    "ic50_1": affinity_result.ic50_1,
-                    "binding_probability_1": affinity_result.binding_probability_1,
-                    "ic50_2": affinity_result.ic50_2,
-                    "binding_probability_2": affinity_result.binding_probability_2,
-                },
-            }
-            if ligand_alias_map:
-                output["ligand_id_map"] = ligand_alias_map
-            if admet_output is not None:
-                output["admet"] = admet_output
-            return output
-
-        if affinity_requested:
-            complex_spec.request_affinity(affinity_binder)
-
-        boltzgen_model = None
-        if run_boltzgen_local:
-            boltzgen_model = _build_boltzgen_from_options(boltzgen_opts)
-
-        result = complex_spec.fold(
+    if action_value == "affinity":
+        affinity_result = complex_spec.affinity(
+            binder=affinity_binder,
             boltz=boltz_model,
-            boltzgen=boltzgen_model,
-            run_boltz=run_boltz_local,
-            run_boltzgen=run_boltzgen_local,
         )
-
-        output = {
+        output: dict[str, Any] = {
             "name": name,
-            "backend": result.backend,
-            "chain_ids": result.chain_ids,
-            "binder_sequences": result.binder_sequences,
+            "binder": affinity_binder,
+            "affinity": _affinity_to_dict(affinity_result),
         }
         if ligand_alias_map:
             output["ligand_id_map"] = ligand_alias_map
         if admet_output is not None:
             output["admet"] = admet_output
-
-        if result.affinity is not None:
-            output["affinity"] = {
-                "ic50": result.affinity.ic50,
-                "binding_probability": result.affinity.binding_probability,
-                "ic50_1": result.affinity.ic50_1,
-                "binding_probability_1": result.affinity.binding_probability_1,
-                "ic50_2": result.affinity.ic50_2,
-                "binding_probability_2": result.affinity.binding_probability_2,
-            }
-
-        if result.structure is None:
-            if structure_output_path or return_mmcif or return_bcif_base64:
-                raise ValueError(
-                    "Structure output requested but no structure was produced."
-                )
-        else:
-            output_kind = _resolve_output_format(
-                structure_output_path,
-                structure_output_format,
-            )
-            if output_kind is None and structure_output_path is not None:
-                output_kind = "cif"
-
-            mmcif_text = None
-            bcif_bytes = None
-            if output_kind == "cif" or return_mmcif:
-                mmcif_text = result.to_mmcif()
-            if output_kind == "bcif" or return_bcif_base64:
-                bcif_bytes = result.to_bcif()
-
-            output_written = None
-            if structure_output_path and output_kind:
-                output_written = _write_structure(
-                    output_path=structure_output_path,
-                    output_format=output_kind,
-                    mmcif_text=mmcif_text,
-                    bcif_bytes=bcif_bytes,
-                )
-
-            structure_info: dict[str, Any] = {
-                "confidence_score": result.structure.confidence_score,
-                "output_path": output_written,
-                "output_format": output_kind,
-            }
-            if return_mmcif and mmcif_text is not None:
-                structure_info["mmcif"] = mmcif_text
-            if return_bcif_base64 and bcif_bytes is not None:
-                structure_info["bcif_base64"] = base64.b64encode(bcif_bytes).decode(
-                    "ascii"
-                )
-            output["structure"] = structure_info
-
-        features = result.features
-        if features is None:
-            if feature_output_path:
-                raise ValueError(
-                    "Feature output requested but no features were produced."
-                )
-        else:
-            features = dict(features)  # Convert Mapping to dict for type compatibility
-            feature_format = None
-            output_written = None
-            if feature_output_path:
-                feature_format = _resolve_feature_output_format(
-                    feature_output_path, feature_output_format
-                )
-                output_written = _save_features(
-                    output_path=feature_output_path,
-                    output_format=feature_format,
-                    features=features,
-                )
-            output["features"] = {
-                "feature_keys": sorted(features.keys()),
-                "feature_shapes": _summarize_features(features),
-                "output_path": output_written,
-                "output_format": feature_format,
-            }
-
         return output
 
-    if async_mode:
-        job_id = _submit_job("refua_complex", run)
-        return {"job_id": job_id, "status": "queued"}
+    if affinity_requested:
+        complex_spec.request_affinity(affinity_binder)
 
+    boltzgen_model = None
+    if run_boltzgen_local:
+        boltzgen_model = _build_boltzgen_from_options(boltzgen_opts)
+
+    result = complex_spec.fold(
+        boltz=boltz_model,
+        boltzgen=boltzgen_model,
+        run_boltz=run_boltz_local,
+        run_boltzgen=run_boltzgen_local,
+    )
+
+    output = {
+        "name": name,
+        "backend": result.backend,
+        "chain_ids": result.chain_ids,
+        "binder_sequences": result.binder_sequences,
+    }
+    if ligand_alias_map:
+        output["ligand_id_map"] = ligand_alias_map
+    if admet_output is not None:
+        output["admet"] = admet_output
+
+    if result.affinity is not None:
+        output["affinity"] = _affinity_to_dict(result.affinity)
+
+    if result.structure is None:
+        if structure_output_path or return_mmcif or return_bcif_base64:
+            raise ValueError(
+                "Structure output requested but no structure was produced."
+            )
+    else:
+        output_kind = _resolve_output_format(
+            structure_output_path, structure_output_format
+        )
+        if output_kind is None and structure_output_path is not None:
+            output_kind = "cif"
+
+        mmcif_text = None
+        bcif_bytes = None
+        if output_kind == "cif" or return_mmcif:
+            mmcif_text = result.to_mmcif()
+        if output_kind == "bcif" or return_bcif_base64:
+            bcif_bytes = result.to_bcif()
+
+        output_written = None
+        if structure_output_path and output_kind:
+            output_written = _write_structure(
+                output_path=structure_output_path,
+                output_format=output_kind,
+                mmcif_text=mmcif_text,
+                bcif_bytes=bcif_bytes,
+            )
+
+        structure_info: dict[str, Any] = {
+            "confidence_score": result.structure.confidence_score,
+            "output_path": output_written,
+            "output_format": output_kind,
+        }
+        if return_mmcif and mmcif_text is not None:
+            structure_info["mmcif"] = mmcif_text
+        if return_bcif_base64 and bcif_bytes is not None:
+            structure_info["bcif_base64"] = base64.b64encode(bcif_bytes).decode("ascii")
+        output["structure"] = structure_info
+
+    features = result.features
+    if features is None:
+        if feature_output_path:
+            raise ValueError("Feature output requested but no features were produced.")
+    else:
+        features = dict(features)
+        feature_format = None
+        output_written = None
+        if feature_output_path:
+            feature_format = _resolve_feature_output_format(
+                feature_output_path,
+                feature_output_format,
+            )
+            output_written = _save_features(
+                output_path=feature_output_path,
+                output_format=feature_format,
+                features=features,
+            )
+        output["features"] = {
+            "feature_keys": sorted(features.keys()),
+            "feature_shapes": _summarize_features(features),
+            "output_path": output_written,
+            "output_format": feature_format,
+        }
+
+    return output
+
+
+def _queue_job(tool_name: str, runner: Callable[[], BaseModel]) -> QueuedJobResponse:
+    job_id = _submit_job(tool_name, lambda: runner().model_dump(mode="json"))
+    return QueuedJobResponse(job_id=job_id)
+
+
+@mcp.tool()
+def refua_fold(
+    entities: list[EntitySpec],
+    *,
+    name: str = "complex",
+    base_dir: str | None = None,
+    constraints: list[ConstraintSpec] | None = None,
+    affinity: AffinityArg = None,
+    run_boltz: bool | None = None,
+    run_boltzgen: bool | None = None,
+    boltz: BoltzOptions | None = None,
+    boltzgen: BoltzGenOptions | None = None,
+    admet: AdmetArg = None,
+    structure_output_path: str | None = None,
+    structure_output_format: Literal["cif", "bcif"] | None = None,
+    return_mmcif: bool = False,
+    return_bcif_base64: bool = False,
+    feature_output_path: str | None = None,
+    feature_output_format: Literal["torch", "npz"] | None = None,
+    async_mode: bool = False,
+) -> FoldResult | QueuedJobResponse:
+    """Run Refua fold/design workflows with strict typed inputs."""
+
+    entities_payload = _entities_to_payload(entities)
+    constraints_payload = _constraints_to_payload(constraints)
+    affinity_payload = _normalize_affinity_arg(affinity)
+    boltz_payload = _model_dict(boltz)
+    boltzgen_payload = _model_dict(boltzgen)
+    admet_payload = _normalize_admet_arg(admet)
+
+    def run() -> FoldResult:
+        output = _run_complex_operation(
+            entities=entities_payload,
+            name=name,
+            base_dir=base_dir,
+            constraints=constraints_payload,
+            affinity=affinity_payload,
+            action="fold",
+            run_boltz=run_boltz,
+            run_boltzgen=run_boltzgen,
+            boltz=boltz_payload,
+            boltzgen=boltzgen_payload,
+            admet=admet_payload,
+            structure_output_path=structure_output_path,
+            structure_output_format=structure_output_format,
+            return_mmcif=return_mmcif,
+            return_bcif_base64=return_bcif_base64,
+            feature_output_path=feature_output_path,
+            feature_output_format=feature_output_format,
+        )
+        return FoldResult.model_validate(output)
+
+    if async_mode:
+        return _queue_job("refua_fold", run)
     return run()
 
 
 @mcp.tool()
-def refua_job(job_id: str, *, include_result: bool = False) -> dict[str, Any]:
+def refua_affinity(
+    entities: list[EntitySpec],
+    *,
+    name: str = "complex",
+    base_dir: str | None = None,
+    binder: str | None = None,
+    boltz: BoltzOptions | None = None,
+    admet: AdmetArg = None,
+    async_mode: bool = False,
+) -> AffinityResultResponse | QueuedJobResponse:
+    """Run affinity-only predictions with strict typed inputs."""
+
+    entities_payload = _entities_to_payload(entities)
+    boltz_payload = _model_dict(boltz)
+    admet_payload = _normalize_admet_arg(admet)
+    affinity_payload: bool | dict[str, Any] = (
+        {"binder": binder} if binder is not None else True
+    )
+
+    def run() -> AffinityResultResponse:
+        output = _run_complex_operation(
+            entities=entities_payload,
+            name=name,
+            base_dir=base_dir,
+            constraints=None,
+            affinity=affinity_payload,
+            action="affinity",
+            run_boltz=True,
+            run_boltzgen=False,
+            boltz=boltz_payload,
+            boltzgen=None,
+            admet=admet_payload,
+            structure_output_path=None,
+            structure_output_format=None,
+            return_mmcif=False,
+            return_bcif_base64=False,
+            feature_output_path=None,
+            feature_output_format=None,
+        )
+        return AffinityResultResponse.model_validate(output)
+
+    if async_mode:
+        return _queue_job("refua_affinity", run)
+    return run()
+
+
+@mcp.tool()
+def refua_antibody_design(
+    antibody: AntibodyEntity,
+    *,
+    context_entities: list[ContextEntitySpec] | None = None,
+    name: str = "antibody_design",
+    base_dir: str | None = None,
+    constraints: list[ConstraintSpec] | None = None,
+    affinity: AffinityArg = None,
+    run_boltz: bool | None = None,
+    run_boltzgen: bool | None = None,
+    boltz: BoltzOptions | None = None,
+    boltzgen: BoltzGenOptions | None = None,
+    admet: AdmetArg = None,
+    structure_output_path: str | None = None,
+    structure_output_format: Literal["cif", "bcif"] | None = None,
+    return_mmcif: bool = False,
+    return_bcif_base64: bool = False,
+    feature_output_path: str | None = None,
+    feature_output_format: Literal["torch", "npz"] | None = None,
+    async_mode: bool = False,
+) -> FoldResult | QueuedJobResponse:
+    """Design/fold with an explicit antibody entrypoint plus optional context entities."""
+
+    merged_entities: list[EntitySpec] = [*(context_entities or []), antibody]
+    entities_payload = _entities_to_payload(merged_entities)
+    constraints_payload = _constraints_to_payload(constraints)
+    affinity_payload = _normalize_affinity_arg(affinity)
+    boltz_payload = _model_dict(boltz)
+    boltzgen_payload = _model_dict(boltzgen)
+    admet_payload = _normalize_admet_arg(admet)
+
+    def run() -> FoldResult:
+        output = _run_complex_operation(
+            entities=entities_payload,
+            name=name,
+            base_dir=base_dir,
+            constraints=constraints_payload,
+            affinity=affinity_payload,
+            action="fold",
+            run_boltz=run_boltz,
+            run_boltzgen=run_boltzgen,
+            boltz=boltz_payload,
+            boltzgen=boltzgen_payload,
+            admet=admet_payload,
+            structure_output_path=structure_output_path,
+            structure_output_format=structure_output_format,
+            return_mmcif=return_mmcif,
+            return_bcif_base64=return_bcif_base64,
+            feature_output_path=feature_output_path,
+            feature_output_format=feature_output_format,
+        )
+        return FoldResult.model_validate(output)
+
+    if async_mode:
+        return _queue_job("refua_antibody_design", run)
+    return run()
+
+
+@mcp.tool()
+def refua_validate_spec(
+    entities: list[EntitySpec],
+    *,
+    action: Literal["fold", "affinity"] = "fold",
+    name: str = "complex",
+    base_dir: str | None = None,
+    constraints: list[ConstraintSpec] | None = None,
+    affinity: AffinityArg = None,
+    run_boltz: bool | None = None,
+    run_boltzgen: bool | None = None,
+    boltz: BoltzOptions | None = None,
+    boltzgen: BoltzGenOptions | None = None,
+    admet: AdmetArg = None,
+    structure_output_path: str | None = None,
+    structure_output_format: Literal["cif", "bcif"] | None = None,
+    feature_output_path: str | None = None,
+    feature_output_format: Literal["torch", "npz"] | None = None,
+    deep_validate: bool = False,
+) -> ValidateSpecResult:
+    """Validate and normalize a request without running fold/affinity inference."""
+
+    entities_payload = _entities_to_payload(entities)
+    constraints_payload = _constraints_to_payload(constraints)
+    affinity_payload = _normalize_affinity_arg(affinity)
+    boltz_payload = _model_dict(boltz)
+    boltzgen_payload = _model_dict(boltzgen)
+    admet_payload = _normalize_admet_arg(admet)
+
+    boltz_opts = _parse_boltz_options(boltz_payload)
+    _parse_boltzgen_options(boltzgen_payload)
+    admet_mode, _ = _parse_admet_options(admet_payload)
+    entity_types, entity_type_counts, ligand_specs, ligand_alias_map = (
+        _analyze_entities(entities_payload)
+    )
+    action_value, run_boltz_local, run_boltzgen_local = _resolve_execution_modes(
+        action=action,
+        entity_types=entity_types,
+        constraints=constraints_payload,
+        affinity=affinity_payload,
+        run_boltz=run_boltz,
+        run_boltzgen=run_boltzgen,
+    )
+
+    if structure_output_path or structure_output_format:
+        _resolve_output_format(structure_output_path, structure_output_format)
+    if feature_output_path:
+        _resolve_feature_output_format(feature_output_path, feature_output_format)
+
+    warnings: list[str] = []
+    if feature_output_format and not feature_output_path:
+        warnings.append(
+            "feature_output_format is ignored unless feature_output_path is provided."
+        )
+    if admet_mode == "auto" and not ligand_specs:
+        warnings.append(
+            "admet='auto' will be skipped because no SMILES ligands are present."
+        )
+    if admet_mode == "on" and not ligand_specs:
+        raise ValueError("ADMET requested but no SMILES ligands are available.")
+
+    if deep_validate:
+        has_ccd = any(
+            str(item.get("type", "")).lower() == "ligand"
+            and item.get("ccd") is not None
+            for item in entities_payload
+        )
+        should_deep_validate = True
+        boltz_mol_dir = None
+        if has_ccd:
+            candidate_mol_dir = _resolve_boltz_mol_dir(None, boltz_opts)
+            if candidate_mol_dir is None or not candidate_mol_dir.exists():
+                should_deep_validate = False
+                warnings.append(
+                    "Skipped deep CCD ligand validation because Boltz molecule assets "
+                    "are not available locally."
+                )
+            else:
+                boltz_mol_dir = candidate_mol_dir
+
+        if should_deep_validate:
+            complex_spec, deep_alias_map, _, _ = _build_complex_from_spec(
+                name=name,
+                base_dir=base_dir,
+                entities=entities_payload,
+                boltz_mol_dir=boltz_mol_dir,
+            )
+            ligand_alias_map = deep_alias_map
+            _apply_constraints(complex_spec, constraints_payload, ligand_alias_map)
+    else:
+        warnings.append(
+            "Deep entity construction checks were skipped. Set deep_validate=true "
+            "to validate against local Refua assets."
+        )
+
+    normalized_input = _compact_dict(
+        {
+            "action": action_value,
+            "name": name,
+            "base_dir": base_dir,
+            "entities": entities_payload,
+            "constraints": constraints_payload,
+            "affinity": affinity_payload,
+            "run_boltz": run_boltz,
+            "run_boltzgen": run_boltzgen,
+            "boltz": boltz_payload,
+            "boltzgen": boltzgen_payload,
+            "admet": admet_payload,
+            "structure_output_path": structure_output_path,
+            "structure_output_format": structure_output_format,
+            "feature_output_path": feature_output_path,
+            "feature_output_format": feature_output_format,
+            "deep_validate": deep_validate,
+        }
+    )
+
+    return ValidateSpecResult(
+        normalized_input=normalized_input,
+        execution_plan=ValidationPlan(
+            action=action_value,
+            run_boltz=run_boltz_local,
+            run_boltzgen=run_boltzgen_local,
+            entity_type_counts=entity_type_counts,
+            ligand_id_map=ligand_alias_map,
+            smiles_ligand_ids=[entry["ligand_id"] for entry in ligand_specs],
+        ),
+        warnings=warnings,
+    )
+
+
+_RECIPE_LIBRARY: dict[str, dict[str, Any]] = {
+    "fold_protein_ligand": {
+        "tool": "refua_fold",
+        "args": {
+            "name": "protein_ligand_fold",
+            "entities": [
+                {
+                    "type": "protein",
+                    "id": "A",
+                    "sequence": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ",
+                },
+                {"type": "ligand", "id": "lig", "smiles": "CCO"},
+            ],
+            "constraints": [
+                {"type": "pocket", "binder": "lig", "contacts": [["A", 5], ["A", 8]]}
+            ],
+            "affinity": {"binder": "lig"},
+        },
+    },
+    "affinity_only": {
+        "tool": "refua_affinity",
+        "args": {
+            "name": "protein_ligand_affinity",
+            "entities": [
+                {
+                    "type": "protein",
+                    "id": "A",
+                    "sequence": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ",
+                },
+                {"type": "ligand", "id": "lig", "smiles": "CCO"},
+            ],
+            "binder": "lig",
+        },
+    },
+    "antibody_design": {
+        "tool": "refua_antibody_design",
+        "args": {
+            "name": "antibody_design",
+            "antibody": {
+                "type": "antibody",
+                "ids": ["H", "L"],
+                "heavy_cdr_lengths": [12, 10, 14],
+                "light_cdr_lengths": [10, 9, 9],
+            },
+            "context_entities": [
+                {
+                    "type": "protein",
+                    "id": "A",
+                    "sequence": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ",
+                }
+            ],
+        },
+    },
+}
+
+
+@mcp.resource(
+    "refua://recipes/index",
+    name="refua_recipe_index",
+    description="Index of canonical Refua MCP recipes.",
+)
+def refua_recipe_index() -> str:
+    return json.dumps(
+        {
+            "template_uri": "refua://recipes/{recipe_name}",
+            "recipe_names": sorted(_RECIPE_LIBRARY.keys()),
+            "note": "Fetch refua://recipes/{recipe_name} for concrete tool args.",
+        },
+        indent=2,
+    )
+
+
+@mcp.resource(
+    "refua://recipes/{recipe_name}",
+    name="refua_recipe_template",
+    description="Canonical Refua MCP recipe by name.",
+)
+def refua_recipe_template(recipe_name: str) -> str:
+    key = str(recipe_name).strip().lower().replace("-", "_")
+    recipe = _RECIPE_LIBRARY.get(key)
+    if recipe is None:
+        raise ValueError(
+            f"Unknown recipe '{recipe_name}'. Available: {sorted(_RECIPE_LIBRARY)}"
+        )
+    return json.dumps(recipe, indent=2)
+
+
+@mcp.tool()
+def refua_job(
+    job_id: str,
+    *,
+    include_result: bool = False,
+    wait_for_terminal_seconds: float | None = None,
+) -> dict[str, Any]:
     """Check status for a background refua job.
 
     Responses may include recommended_poll_seconds plus queue/estimate metadata for
     queued or running jobs.
+
+    wait_for_terminal_seconds optionally blocks until the job reaches a terminal state
+    (success/error) or the timeout is reached. Use this to reduce client-side polling.
     """
-    return _job_snapshot(job_id, include_result)
+    if wait_for_terminal_seconds is None:
+        return _job_snapshot(job_id, include_result)
+    wait_seconds = float(wait_for_terminal_seconds)
+    if wait_seconds <= 0:
+        return _job_snapshot(job_id, include_result)
+    return _poll_job_until_terminal(
+        job_id,
+        include_result=include_result,
+        wait_for_terminal_seconds=wait_seconds,
+    )
 
 
 if _ADMET_AVAILABLE:
@@ -1396,6 +2412,7 @@ if _ADMET_AVAILABLE:
 
         Requires refua[admet] (transformers + huggingface_hub). Optionally pass
         task_ids to restrict the endpoints that are evaluated.
+        Supports experimental task-augmented execution via MCP tasks.
         """
         if not smiles:
             raise ValueError("smiles is required.")
@@ -1407,6 +2424,31 @@ if _ADMET_AVAILABLE:
             include_scoring=bool(include_scoring),
             task_ids=normalized_tasks,
         )
+
+
+def _configure_experimental_task_support() -> None:
+    # FastMCP does not yet expose taskSupport metadata directly. We register the
+    # low-level handlers to advertise execution.taskSupport and support
+    # task-augmented calls for long-running tools.
+    lowlevel = mcp._mcp_server
+    lowlevel.experimental.enable_tasks()
+    original_update_capabilities = lowlevel.experimental.update_capabilities
+
+    def update_capabilities_with_tool_task_call(capabilities: Any) -> None:
+        original_update_capabilities(capabilities)
+        if (
+            capabilities.tasks is not None
+            and capabilities.tasks.requests is not None
+            and capabilities.tasks.requests.tools is not None
+        ):
+            capabilities.tasks.requests.tools.call = TasksCallCapability()
+
+    lowlevel.experimental.update_capabilities = update_capabilities_with_tool_task_call
+    lowlevel.list_tools()(_list_tools_with_task_support)
+    lowlevel.call_tool(validate_input=False)(_call_tool_with_task_support)
+
+
+_configure_experimental_task_support()
 
 
 def main() -> None:
