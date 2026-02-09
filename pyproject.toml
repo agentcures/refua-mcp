@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "refua-mcp"
-version = "0.5.1"
+version = "0.5.2"
 description = "MCP server for Refua Boltz2 folding/affinity and BoltzGen design workflows."
 readme = "README.md"
 license = "MIT"
