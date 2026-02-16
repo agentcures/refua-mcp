@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    name: Unit Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Run test suite
+        run: pytest -q
+
+  mcp-protocol:
+    name: MCP Protocol Conformance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Validate MCP SDK protocol revision
+        run: |
+          python - <<'PY'
+          import mcp.types as t
+          expected = "2025-11-25"
+          assert str(t.LATEST_PROTOCOL_VERSION) == expected, (
+              f"MCP SDK latest protocol version {t.LATEST_PROTOCOL_VERSION} != {expected}"
+          )
+          PY
+
+      - name: Run MCP protocol and SDK acceptance tests
+        run: |
+          pytest -q tests/test_sdk_acceptance.py tests/test_capabilities_and_completions.py
