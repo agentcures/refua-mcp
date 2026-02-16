@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 from mcp.types import CallToolResult
 
 import refua_mcp.server as server
@@ -122,3 +125,68 @@ def test_refua_job_wait_for_terminal_uses_long_poll(monkeypatch) -> None:
         wait_for_terminal_seconds=9,
     )
     assert result == expected
+
+
+def _wait_for_terminal(job_id: str, *, timeout: float = 5.0) -> dict[str, object]:
+    deadline = time.time() + timeout
+    snapshot = server._job_snapshot(job_id, include_result=True)
+    while snapshot["status"] in {"queued", "running"}:
+        if time.time() >= deadline:
+            raise TimeoutError(f"Job did not reach terminal state: {job_id}")
+        time.sleep(0.01)
+        snapshot = server._job_snapshot(job_id, include_result=True)
+    return snapshot
+
+
+def test_cancel_job_marks_queued_job_cancelled() -> None:
+    gate = threading.Event()
+
+    def blocking_runner() -> dict[str, bool]:
+        gate.wait(timeout=2.0)
+        return {"ok": True}
+
+    first = server._submit_job("test_tool", blocking_runner, queue_timeout_seconds=30)
+    second = server._submit_job(
+        "test_tool",
+        lambda: {"ok": True},
+        queue_timeout_seconds=30,
+    )
+
+    snapshot = server._cancel_job(
+        second,
+        reason={
+            "code": "job_cancelled",
+            "message": "cancelled from test",
+            "retryable": True,
+        },
+    )
+    assert snapshot["status"] == "cancelled"
+    assert snapshot["error"]["code"] == "job_cancelled"
+
+    gate.set()
+    _wait_for_terminal(first)
+
+
+def test_queue_timeout_fails_stale_job() -> None:
+    gate = threading.Event()
+
+    def blocking_runner() -> dict[str, bool]:
+        gate.wait(timeout=2.0)
+        return {"ok": True}
+
+    first = server._submit_job("test_tool", blocking_runner, queue_timeout_seconds=30)
+    second = server._submit_job(
+        "test_tool",
+        lambda: {"ok": True},
+        queue_timeout_seconds=0.01,
+    )
+
+    time.sleep(0.05)
+    gate.set()
+
+    first_snapshot = _wait_for_terminal(first)
+    assert first_snapshot["status"] in {"success", "cancelled", "error"}
+
+    second_snapshot = _wait_for_terminal(second)
+    assert second_snapshot["status"] == "error"
+    assert second_snapshot["error"]["code"] == "queue_timeout"

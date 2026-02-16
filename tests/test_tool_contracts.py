@@ -206,6 +206,30 @@ def test_non_task_wrapper_returns_structured_content() -> None:
     anyio.run(_run)
 
 
+def test_non_task_wrapper_returns_standard_error_contract() -> None:
+    async def _run() -> None:
+        original_get_context = server.mcp.get_context
+        try:
+            server.mcp.get_context = lambda: SimpleNamespace(
+                request_context=SimpleNamespace(experimental=None)
+            )
+            result = await server._call_tool_with_task_support(
+                "refua_protein_properties",
+                {"sequence": "   "},
+            )
+        finally:
+            server.mcp.get_context = original_get_context
+
+        assert isinstance(result, CallToolResult)
+        assert result.isError is True
+        assert isinstance(result.structuredContent, dict)
+        error = result.structuredContent.get("error", {})
+        assert error.get("code") == "invalid_input"
+        assert "hint" in error
+
+    anyio.run(_run)
+
+
 def test_exploratory_name_guard_blocks_probe_patterns() -> None:
     for name in ("sanity_antibody", "schema_probe", "fold_probe2", "smoke_run"):
         try:
