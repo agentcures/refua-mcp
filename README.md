@@ -2,6 +2,8 @@
 
 MCP server exposing strict, typed Refua tools for Boltz2 folding/affinity and BoltzGen design workflows.
 
+Protocol target: MCP spec revision `2025-11-25`.
+
 ## Install
 
 ```bash
@@ -13,6 +15,12 @@ ADMET predictions are optional; install `refua[admet]` to enable them:
 
 ```bash
 pip install refua[admet]
+```
+
+OpenTelemetry spans/metrics are optional:
+
+```bash
+pip install "refua-mcp[observability]"
 ```
 
 Boltz2 and BoltzGen require model/molecule assets. If you don't have them, refua can download them for you automatically:
@@ -63,12 +71,34 @@ raise the startup timeout in your Codex `config.toml`:
 startup_timeout_sec = 30
 ```
 
+## Transport And Security
+
+Default transport is `stdio`. You can run HTTP transports with runtime env vars:
+
+```bash
+REFUA_MCP_TRANSPORT=streamable-http python -m refua_mcp.server
+```
+
+Supported transport modes:
+- `REFUA_MCP_TRANSPORT=stdio|sse|streamable-http`
+- `REFUA_MCP_HOST` / `REFUA_MCP_PORT`
+- `REFUA_MCP_MOUNT_PATH`
+
+Security/runtime controls:
+- `REFUA_MCP_ENABLE_DNS_REBINDING_PROTECTION=true|false`
+- `REFUA_MCP_ALLOWED_HOSTS=host1,host2`
+- `REFUA_MCP_ALLOWED_ORIGINS=https://origin1,https://origin2`
+- `REFUA_MCP_AUTH_TOKENS=token1,token2` (static bearer tokens for HTTP transports)
+- `REFUA_MCP_TASK_TIMEOUT_SECONDS`
+- `REFUA_MCP_QUEUE_TIMEOUT_SECONDS`
+
 ## Tools
 
 - `refua_validate_spec`: validate and normalize a request without running folding/affinity.
 - `refua_fold`: run fold/design workflows with typed entities and constraints.
 - `refua_affinity`: run affinity-only predictions.
 - `refua_antibody_design`: focused antibody entrypoint (`antibody` + optional `context_entities`).
+- `refua_protein_properties`: compute sequence-based protein properties via Refua's `ProteinProperties` API.
 - `refua_job`: check status/results for background jobs.
 - `refua_admet_profile` (optional): run model-based ADMET predictions for SMILES strings (requires `refua[admet]`).
 
@@ -86,25 +116,41 @@ Input-compatibility notes:
 Execution-policy notes:
 - `refua_fold` and `refua_antibody_design` block exploratory names by default (for example `sanity_*`, `*_probe`, `schema_*`, `smoke_*`) to avoid costly preflight runs.
 - If an exploratory run is intentionally needed, set `allow_exploratory_run=true`.
+- Asynchronous fold/affinity/design tools accept `queue_timeout_seconds` (optional).
+
+Error-contract notes:
+- Tool errors return a structured payload with `error.code`, `error.message`, optional `error.hint`, and `error.retryable`.
 
 ## Resources And Templates
 
+- `refua://capabilities` (resource): runtime feature flags, protocol revision, transport/security config summary.
 - `refua://recipes/index` (resource): lists canonical recipe names.
 - `refua://recipes/{recipe_name}` (resource template): returns concrete tool/args examples.
+- `refua://protein-properties/index` (resource): lists available protein property names/groups.
+- `refua://protein-properties/group/{group_name}` (resource template): lists property names in a group.
+- `refua://protein-properties/property/{property_name}` (resource template): property metadata.
+
+Completion support:
+- `refua://recipes/{recipe_name}` completions for recipe names.
+- `refua://protein-properties/group/{group_name}` completions for group names.
+- `refua://protein-properties/property/{property_name}` completions for property names.
 
 Recipe names:
 - `fold_protein_ligand`
 - `affinity_only`
 - `antibody_design`
+- `protein_properties`
 
 ## Workflow
 
 Recommended call sequence:
 
 1. Read `refua://recipes/index` and optionally a recipe template.
-2. Call `refua_validate_spec` to catch schema/logic issues before expensive runs (`deep_validate=true` for asset-backed construction checks).
-3. Execute `refua_fold`, `refua_affinity`, or `refua_antibody_design`.
-4. For long runs, set `async_mode=true` and poll `refua_job`.
+2. Read `refua://capabilities` for runtime support and limits.
+3. For sequence-only property analysis, call `refua_protein_properties`.
+4. Call `refua_validate_spec` to catch schema/logic issues before expensive runs (`deep_validate=true` for asset-backed construction checks).
+5. Execute `refua_fold`, `refua_affinity`, or `refua_antibody_design`.
+6. For long runs, set `async_mode=true` and poll `refua_job`.
 
 ## Examples
 
@@ -191,6 +237,19 @@ ADMET predictions:
 }
 ```
 
+Protein properties:
+
+```json
+{
+  "tool": "refua_protein_properties",
+  "args": {
+    "sequence": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ",
+    "groups": ["basic"],
+    "include_catalog": true
+  }
+}
+```
+
 Note: DNA/RNA entities are supported for Boltz2 folding only (BoltzGen does not accept DNA/RNA entities).
 
 ## Long-Running Jobs
@@ -223,6 +282,7 @@ For queued/running jobs, the response includes `recommended_poll_seconds` plus q
 and estimate metadata (`queue_position`, `queue_depth`, `average_runtime_seconds`,
 `estimated_start_seconds`, `estimated_remaining_seconds`).
 Set `include_result=true` once complete to fetch results.
+Set `cancel=true` in `refua_job` to cancel queued/running jobs.
 
 Long-poll support:
 
@@ -232,6 +292,7 @@ Long-poll support:
   "args": {
     "job_id": "...",
     "wait_for_terminal_seconds": 300,
+    "cancel": false,
     "include_result": true
   }
 }
@@ -241,7 +302,9 @@ Long-poll support:
 
 This server enables MCP experimental task support (`tasks/get`, `tasks/result`,
 `tasks/list`, `tasks/cancel`) and advertises task execution support for
-`refua_fold`, `refua_affinity`, `refua_antibody_design`, and `refua_admet_profile`.
+`refua_validate_spec`, `refua_fold`, `refua_affinity`, `refua_antibody_design`,
+and `refua_admet_profile`.
 
 If your client supports task-augmented tool calls, prefer tasks for long-running
-operations. Otherwise, continue with `async_mode=true` + `refua_job`.
+operations. Task cancellation (`tasks/cancel`) is wired to background job cancellation.
+Otherwise, continue with `async_mode=true` + `refua_job`.
