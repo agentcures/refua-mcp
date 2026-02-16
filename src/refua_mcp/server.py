@@ -3,22 +3,33 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import logging
+import os
 import re
 import statistics
 import threading
 import time
-import traceback
 import uuid
+from contextlib import contextmanager
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Callable, Iterable, Literal, Mapping
 
 import anyio
 from mcp.server.fastmcp import FastMCP
-from mcp.types import CallToolResult, TextContent
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import (
+    LATEST_PROTOCOL_VERSION,
+    CallToolResult,
+    Completion,
+    PromptReference,
+    ResourceTemplateReference,
+    TextContent,
+)
 from mcp.types import TaskExecutionMode
 from mcp.types import TasksCallCapability
 from mcp.types import Tool as McpTool
@@ -32,23 +43,32 @@ else:
     Boltz2 = BoltzGen = Complex = SmallMolecule = Any
     AdmetPredictor = Any
 
+LOGGER = logging.getLogger(__name__)
+MCP_SPEC_REVISION = "2025-11-25"
+if str(LATEST_PROTOCOL_VERSION) != MCP_SPEC_REVISION:
+    LOGGER.warning(
+        "MCP SDK latest protocol version (%s) differs from server target revision (%s).",
+        str(LATEST_PROTOCOL_VERSION),
+        MCP_SPEC_REVISION,
+    )
+
 SERVER_INSTRUCTIONS = """
 Use the typed Refua tools directly instead of speculative probing.
 
 Recommended sequence:
-1) Read recipe resources (`refua://recipes/index` and `refua://recipes/{recipe_name}`)
-   for canonical call shapes.
-2) Call `refua_validate_spec` to normalize/validate before expensive work.
+1) Read capability/resource guidance (`refua://capabilities`,
+   `refua://recipes/index`, and `refua://recipes/{recipe_name}`).
+2) For sequence-only analysis, use `refua_protein_properties`.
+   Use `properties` for explicit property names, or `groups` for grouped summaries.
+3) Call `refua_validate_spec` to normalize/validate before expensive work.
    Do not execute schema probes, sanity folds, or smoke-test designs.
-3) Execute with the focused tool:
+4) Execute with the focused tool:
    - `refua_fold` for structure/design folds
    - `refua_affinity` for affinity-only predictions
    - `refua_antibody_design` for antibody-heavy workflows
-4) For long runs, set `async_mode=true` and poll `refua_job` using
+5) For long runs, set `async_mode=true` and poll `refua_job` using
    `recommended_poll_seconds` or `wait_for_terminal_seconds`.
 """
-
-mcp = FastMCP("refua-mcp", instructions=SERVER_INSTRUCTIONS)
 
 DEFAULT_BOLTZ_CACHE = str(Path("~/.boltz").expanduser())
 JOB_HISTORY_LIMIT = 100
@@ -61,6 +81,269 @@ LONG_POLL_MAX_WAIT_SECONDS = 900.0
 LONG_POLL_MIN_SLEEP_SECONDS = 5.0
 LONG_POLL_MAX_SLEEP_SECONDS = 120.0
 ADMET_DEPENDENCIES = ("transformers", "huggingface_hub")
+DEFAULT_TASK_TIMEOUT_SECONDS = 7200.0
+DEFAULT_QUEUE_TIMEOUT_SECONDS = 1800.0
+
+
+def _parse_env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value.")
+
+
+def _parse_env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return float(default)
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a float.") from exc
+    if parsed < 0:
+        raise ValueError(f"{name} must be >= 0.")
+    return parsed
+
+
+def _parse_env_csv(name: str) -> tuple[str, ...]:
+    value = os.environ.get(name, "")
+    if not value.strip():
+        return ()
+    return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def _runtime_mount_path() -> str:
+    mount_path = os.environ.get("REFUA_MCP_MOUNT_PATH", "/").strip() or "/"
+    if not mount_path.startswith("/"):
+        mount_path = f"/{mount_path}"
+    return mount_path
+
+
+def _default_allowed_hosts(host: str, port: int) -> tuple[str, ...]:
+    defaults = {
+        host,
+        f"{host}:{port}",
+    }
+    if host in {"127.0.0.1", "localhost"}:
+        defaults.update(
+            {
+                "localhost",
+                f"localhost:{port}",
+                "127.0.0.1",
+                f"127.0.0.1:{port}",
+            }
+        )
+    return tuple(sorted(defaults))
+
+
+def _default_allowed_origins(host: str, port: int) -> tuple[str, ...]:
+    defaults = {
+        f"http://{host}:{port}",
+    }
+    if host in {"127.0.0.1", "localhost"}:
+        defaults.update(
+            {
+                f"http://localhost:{port}",
+                f"http://127.0.0.1:{port}",
+            }
+        )
+    return tuple(sorted(defaults))
+
+
+class _StaticTokenVerifier:
+    def __init__(self, tokens: tuple[str, ...]):
+        self._tokens = frozenset(tokens)
+
+    async def verify_token(self, token: str) -> Any:
+        if token in self._tokens:
+            from mcp.server.auth.provider import AccessToken
+
+            return AccessToken(
+                token=token,
+                client_id="refua-mcp-static-client",
+                scopes=[],
+                expires_at=None,
+                resource=None,
+            )
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeServerConfig:
+    transport: Literal["stdio", "sse", "streamable-http"]
+    host: str
+    port: int
+    mount_path: str
+    task_timeout_seconds: float
+    queue_timeout_seconds: float
+    enable_dns_rebinding_protection: bool
+    allowed_hosts: tuple[str, ...] = field(default_factory=tuple)
+    allowed_origins: tuple[str, ...] = field(default_factory=tuple)
+    token_count: int = 0
+    transport_security: TransportSecuritySettings | None = None
+    token_verifier: Any | None = None
+
+
+def _build_runtime_server_config() -> RuntimeServerConfig:
+    transport_raw = os.environ.get("REFUA_MCP_TRANSPORT", "stdio").strip().lower()
+    if transport_raw not in {"stdio", "sse", "streamable-http"}:
+        raise ValueError(
+            "REFUA_MCP_TRANSPORT must be one of: stdio, sse, streamable-http."
+        )
+    transport: Literal["stdio", "sse", "streamable-http"] = transport_raw  # type: ignore[assignment]
+
+    host = os.environ.get("REFUA_MCP_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port = int(os.environ.get("REFUA_MCP_PORT", "8000"))
+    if port <= 0:
+        raise ValueError("REFUA_MCP_PORT must be > 0.")
+    mount_path = _runtime_mount_path()
+
+    task_timeout_seconds = _parse_env_float(
+        "REFUA_MCP_TASK_TIMEOUT_SECONDS",
+        DEFAULT_TASK_TIMEOUT_SECONDS,
+    )
+    queue_timeout_seconds = _parse_env_float(
+        "REFUA_MCP_QUEUE_TIMEOUT_SECONDS",
+        DEFAULT_QUEUE_TIMEOUT_SECONDS,
+    )
+
+    enable_dns_rebinding_protection = _parse_env_bool(
+        "REFUA_MCP_ENABLE_DNS_REBINDING_PROTECTION",
+        transport in {"sse", "streamable-http"},
+    )
+    allowed_hosts = _parse_env_csv("REFUA_MCP_ALLOWED_HOSTS")
+    allowed_origins = _parse_env_csv("REFUA_MCP_ALLOWED_ORIGINS")
+    if transport in {"sse", "streamable-http"} and enable_dns_rebinding_protection:
+        if not allowed_hosts:
+            allowed_hosts = _default_allowed_hosts(host, port)
+        if not allowed_origins:
+            allowed_origins = _default_allowed_origins(host, port)
+
+    transport_security = None
+    if transport in {"sse", "streamable-http"}:
+        transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=enable_dns_rebinding_protection,
+            allowed_hosts=list(allowed_hosts),
+            allowed_origins=list(allowed_origins),
+        )
+
+    auth_tokens = _parse_env_csv("REFUA_MCP_AUTH_TOKENS")
+    token_verifier = _StaticTokenVerifier(auth_tokens) if auth_tokens else None
+
+    return RuntimeServerConfig(
+        transport=transport,
+        host=host,
+        port=port,
+        mount_path=mount_path,
+        task_timeout_seconds=task_timeout_seconds,
+        queue_timeout_seconds=queue_timeout_seconds,
+        enable_dns_rebinding_protection=enable_dns_rebinding_protection,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+        token_count=len(auth_tokens),
+        transport_security=transport_security,
+        token_verifier=token_verifier,
+    )
+
+
+_RUNTIME_CONFIG = _build_runtime_server_config()
+mcp = FastMCP(
+    "refua-mcp",
+    instructions=SERVER_INSTRUCTIONS,
+    host=_RUNTIME_CONFIG.host,
+    port=_RUNTIME_CONFIG.port,
+    mount_path=_RUNTIME_CONFIG.mount_path,
+    token_verifier=_RUNTIME_CONFIG.token_verifier,
+    transport_security=_RUNTIME_CONFIG.transport_security,
+)
+
+try:  # noqa: SIM105
+    _MCP_SDK_VERSION = package_version("mcp")
+except PackageNotFoundError:
+    _MCP_SDK_VERSION = None
+
+try:  # noqa: SIM105
+    _REFUA_VERSION = package_version("refua")
+except PackageNotFoundError:
+    _REFUA_VERSION = None
+
+try:  # Optional observability dependency.
+    from opentelemetry import metrics as otel_metrics  # type: ignore[reportMissingImports]
+    from opentelemetry import trace as otel_trace  # type: ignore[reportMissingImports]
+except Exception:  # pragma: no cover - environment dependent optional import.
+    otel_metrics = None
+    otel_trace = None
+
+_OTEL_AVAILABLE = otel_trace is not None and otel_metrics is not None
+_OTEL_TRACER = (
+    otel_trace.get_tracer("refua-mcp", _MCP_SDK_VERSION or "unknown")
+    if _OTEL_AVAILABLE
+    else None
+)
+_OTEL_METER = (
+    otel_metrics.get_meter("refua-mcp", _MCP_SDK_VERSION or "unknown")
+    if _OTEL_AVAILABLE
+    else None
+)
+_JOB_SUBMITTED_COUNTER = (
+    _OTEL_METER.create_counter(
+        "refua_mcp.jobs.submitted",
+        unit="1",
+        description="Count of background jobs submitted.",
+    )
+    if _OTEL_METER is not None
+    else None
+)
+_JOB_COMPLETED_COUNTER = (
+    _OTEL_METER.create_counter(
+        "refua_mcp.jobs.completed",
+        unit="1",
+        description="Count of successfully completed background jobs.",
+    )
+    if _OTEL_METER is not None
+    else None
+)
+_JOB_FAILED_COUNTER = (
+    _OTEL_METER.create_counter(
+        "refua_mcp.jobs.failed",
+        unit="1",
+        description="Count of failed background jobs.",
+    )
+    if _OTEL_METER is not None
+    else None
+)
+_JOB_CANCELLED_COUNTER = (
+    _OTEL_METER.create_counter(
+        "refua_mcp.jobs.cancelled",
+        unit="1",
+        description="Count of cancelled background jobs.",
+    )
+    if _OTEL_METER is not None
+    else None
+)
+_JOB_RUNTIME_HISTOGRAM = (
+    _OTEL_METER.create_histogram(
+        "refua_mcp.jobs.runtime_seconds",
+        unit="s",
+        description="Background job runtime in seconds.",
+    )
+    if _OTEL_METER is not None
+    else None
+)
+_JOB_QUEUE_DEPTH_HISTOGRAM = (
+    _OTEL_METER.create_histogram(
+        "refua_mcp.jobs.queue_depth",
+        unit="1",
+        description="Queue depth observed when jobs are submitted or polled.",
+    )
+    if _OTEL_METER is not None
+    else None
+)
 
 
 def _module_available(name: str) -> bool:
@@ -78,8 +361,145 @@ _PROBE_RUN_NAME_RE = re.compile(
 )
 
 
+@contextmanager
+def _trace_span(name: str, **attributes: Any) -> Any:
+    if _OTEL_TRACER is None:
+        yield None
+        return
+    with _OTEL_TRACER.start_as_current_span(name) as span:
+        for key, value in attributes.items():
+            if value is None:
+                continue
+            try:
+                span.set_attribute(key, value)
+            except Exception:
+                continue
+        yield span
+
+
+def _metric_add(
+    counter: Any, value: int, *, attributes: Mapping[str, Any] | None = None
+) -> None:
+    if counter is None:
+        return
+    try:
+        counter.add(value, attributes=dict(attributes or {}))
+    except Exception:
+        return
+
+
+def _metric_record(
+    histogram: Any, value: float, *, attributes: Mapping[str, Any] | None = None
+) -> None:
+    if histogram is None:
+        return
+    try:
+        histogram.record(value, attributes=dict(attributes or {}))
+    except Exception:
+        return
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class ErrorContract(StrictModel):
+    code: str
+    message: str
+    hint: str | None = None
+    retryable: bool = False
+    details: dict[str, Any] | None = None
+
+
+def _error_contract(
+    *,
+    code: str,
+    message: str,
+    hint: str | None = None,
+    retryable: bool = False,
+    details: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = ErrorContract(
+        code=code,
+        message=message,
+        hint=hint,
+        retryable=retryable,
+        details=dict(details) if details is not None else None,
+    )
+    return payload.model_dump(exclude_none=True)
+
+
+def _error_contract_from_exception(exc: Exception) -> dict[str, Any]:
+    message = str(exc).strip() or type(exc).__name__
+    code = "internal_error"
+    hint: str | None = "Retry or inspect server logs for details."
+    retryable = False
+    exception_name = type(exc).__name__
+
+    if isinstance(exc, ValueError):
+        code = "invalid_input"
+        hint = "Check tool arguments against the published schema."
+    elif exception_name in {"ValidationError"}:
+        code = "invalid_input"
+        hint = "Check tool arguments against the published schema."
+    elif exception_name in {"ToolError"}:
+        if any(
+            token in message.lower()
+            for token in (" required", "invalid", "unknown", "must be", "cannot")
+        ):
+            code = "invalid_input"
+            hint = "Check tool arguments against the published schema."
+        else:
+            code = "tool_execution_error"
+            hint = "Inspect tool arguments and server logs."
+    elif isinstance(exc, FileNotFoundError):
+        code = "asset_not_found"
+        hint = "Confirm that required files/assets are present and readable."
+    elif isinstance(exc, ModuleNotFoundError):
+        code = "dependency_missing"
+        hint = "Install the missing dependency and restart the MCP server."
+    elif isinstance(exc, PermissionError):
+        code = "permission_denied"
+        hint = "Grant the process access to required files/directories."
+    elif isinstance(exc, TimeoutError):
+        code = "timeout"
+        hint = "Increase timeout values or reduce workload size."
+        retryable = True
+    elif isinstance(exc, KeyError):
+        code = "not_found"
+        hint = "Verify referenced ids/names exist."
+    elif isinstance(exc, RuntimeError):
+        code = "runtime_error"
+        hint = "Inspect runtime configuration and required model assets."
+        retryable = True
+
+    lower_message = message.lower()
+    if "refua[admet]" in lower_message:
+        code = "dependency_missing"
+        hint = "Install refua[admet] to enable ADMET predictions."
+    elif "task-augmented execution is not implemented" in lower_message:
+        code = "task_mode_unsupported"
+        hint = "Invoke the tool without task augmentation or choose a supported tool."
+    elif "unknown recipe" in lower_message:
+        code = "unknown_recipe"
+        hint = "Read refua://recipes/index to list valid recipe names."
+
+    return _error_contract(
+        code=code,
+        message=message,
+        hint=hint,
+        retryable=retryable,
+        details={"exception_type": exception_name},
+    )
+
+
+def _error_call_tool_result(error: Mapping[str, Any]) -> CallToolResult:
+    payload = {"error": dict(error)}
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(payload, indent=2))],
+        structuredContent=payload,
+        isError=True,
+    )
 
 
 class ChainEntitySpec(StrictModel):
@@ -389,6 +809,16 @@ class AffinityResultResponse(StrictModel):
     admet: dict[str, Any] | None = None
 
 
+class ProteinPropertiesResult(StrictModel):
+    sequence: str
+    normalized_sequence: str
+    values: dict[str, Any]
+    selected_properties: list[str] | None = None
+    selected_groups: list[str] | None = None
+    available_properties: list[str] | None = None
+    available_property_groups: list[str] | None = None
+
+
 class QueuedJobResponse(StrictModel):
     job_id: str
     status: Literal["queued"] = "queued"
@@ -419,13 +849,17 @@ class JobRecord:
     started_at: float | None = None
     finished_at: float | None = None
     result: dict[str, Any] | None = None
-    error: str | None = None
+    error: dict[str, Any] | None = None
+    queue_timeout_seconds: float | None = None
+    cancel_requested: bool = False
 
 
 _JOB_LOCK = threading.Lock()
 _JOB_STORE: OrderedDict[str, JobRecord] = OrderedDict()
 _JOB_EXECUTOR = ThreadPoolExecutor(max_workers=JOB_MAX_WORKERS)
+_TASK_JOB_MAP: dict[str, str] = {}
 _TASK_SUPPORT_BY_TOOL: dict[str, TaskExecutionMode] = {
+    "refua_validate_spec": "optional",
     "refua_fold": "optional",
     "refua_affinity": "optional",
     "refua_antibody_design": "optional",
@@ -474,6 +908,72 @@ def _queue_position_locked(job_id: str) -> int:
 
 def _queue_depth_locked() -> int:
     return sum(1 for job in _JOB_STORE.values() if job.status == "queued")
+
+
+def _register_task_job(task_id: str, job_id: str) -> None:
+    with _JOB_LOCK:
+        _TASK_JOB_MAP[str(task_id)] = str(job_id)
+
+
+def _unregister_task_job(task_id: str, job_id: str | None = None) -> None:
+    key = str(task_id)
+    with _JOB_LOCK:
+        current = _TASK_JOB_MAP.get(key)
+        if current is None:
+            return
+        if job_id is not None and current != str(job_id):
+            return
+        _TASK_JOB_MAP.pop(key, None)
+
+
+def _lookup_task_job(task_id: str) -> str | None:
+    with _JOB_LOCK:
+        return _TASK_JOB_MAP.get(str(task_id))
+
+
+def _queue_timeout_seconds(job: JobRecord) -> float:
+    if job.queue_timeout_seconds is not None:
+        return max(0.0, float(job.queue_timeout_seconds))
+    return max(0.0, float(_RUNTIME_CONFIG.queue_timeout_seconds))
+
+
+def _cancel_job(
+    job_id: str,
+    *,
+    reason: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    snapshot_only = False
+    with _JOB_LOCK:
+        job = _JOB_STORE.get(job_id)
+        if job is None:
+            raise ValueError(f"Unknown job id: {job_id}")
+        if job.status in {"success", "error", "cancelled"}:
+            snapshot_only = True
+        else:
+            cancellation_error = dict(
+                reason
+                or _error_contract(
+                    code="job_cancelled",
+                    message="Job was cancelled.",
+                    hint="Resubmit the job if you still need the result.",
+                    retryable=True,
+                )
+            )
+            job.cancel_requested = True
+            job.status = "cancelled"
+            job.error = cancellation_error
+            if job.finished_at is None:
+                job.finished_at = time.time()
+
+            _metric_add(
+                _JOB_CANCELLED_COUNTER,
+                1,
+                attributes={"tool": job.tool},
+            )
+    if snapshot_only:
+        return _job_snapshot(job_id, include_result=False)
+
+    return _job_snapshot(job_id, include_result=False)
 
 
 def _task_support_mode(tool_name: str) -> TaskExecutionMode:
@@ -529,6 +1029,8 @@ def _build_task_runner(
     tool_name: str, arguments: Mapping[str, Any]
 ) -> Callable[[], dict[str, Any]] | None:
     kwargs = dict(arguments)
+    if tool_name == "refua_validate_spec":
+        return lambda: _coerce_tool_result_dict(refua_validate_spec(**kwargs))
     if tool_name in {"refua_fold", "refua_affinity", "refua_antibody_design"}:
         # task-augmented execution already runs in background; avoid nested async jobs.
         kwargs["async_mode"] = False
@@ -586,64 +1088,94 @@ async def _call_tool_with_task_support(
 
     # Non task-augmented calls behave exactly like standard FastMCP tool execution.
     if experimental is None or not experimental.is_task:
-        result = await mcp._tool_manager.call_tool(
-            name,
-            arguments,
-            context=context,
-            convert_result=True,
-        )
-        return _normalize_task_tool_result(result)
+        try:
+            result = await mcp._tool_manager.call_tool(
+                name,
+                arguments,
+                context=context,
+                convert_result=True,
+            )
+            return _normalize_task_tool_result(result)
+        except Exception as exc:
+            return _error_call_tool_result(_error_contract_from_exception(exc))
 
     runner = _build_task_runner(name, arguments)
     if runner is None:
-        return CallToolResult(
-            content=[
-                TextContent(
-                    type="text",
-                    text=f"Task-augmented execution is not implemented for tool '{name}'.",
-                )
-            ],
-            isError=True,
+        return _error_call_tool_result(
+            _error_contract(
+                code="task_mode_unsupported",
+                message=f"Task-augmented execution is not implemented for tool '{name}'.",
+                hint="Invoke this tool without task augmentation.",
+                retryable=False,
+            )
         )
 
     async def work(task_context: Any) -> CallToolResult:
-        await task_context.update_status("queued")
-        job_id = _submit_job(name, runner)
+        task_id = str(getattr(task_context, "task_id", ""))
+        with _trace_span("refua.task.run", tool=name):
+            await task_context.update_status("queued")
+            job_id = _submit_job(name, runner)
+            if task_id:
+                _register_task_job(task_id, job_id)
 
-        while True:
-            snapshot = _job_snapshot(job_id, include_result=True)
-            status = str(snapshot["status"])
+            started = time.time()
+            timeout_seconds = _RUNTIME_CONFIG.task_timeout_seconds
 
-            if status == "success":
-                return _normalize_task_tool_result(snapshot.get("result"))
+            try:
+                while True:
+                    snapshot = _job_snapshot(job_id, include_result=True)
+                    status = str(snapshot["status"])
 
-            if status == "error":
-                return CallToolResult(
-                    content=[
-                        TextContent(
-                            type="text",
-                            text=str(snapshot.get("error", "Task failed.")),
+                    if status == "success":
+                        return _normalize_task_tool_result(snapshot.get("result"))
+
+                    if status in {"error", "cancelled"}:
+                        error_payload = snapshot.get("error")
+                        if not isinstance(error_payload, Mapping):
+                            error_payload = _error_contract(
+                                code="task_failed",
+                                message=str(error_payload or "Task failed."),
+                                hint="Inspect server logs for additional diagnostics.",
+                            )
+                        return _error_call_tool_result(error_payload)
+
+                    if (
+                        timeout_seconds > 0
+                        and (time.time() - started) > timeout_seconds
+                    ):
+                        timeout_error = _error_contract(
+                            code="task_timeout",
+                            message=(
+                                f"Task exceeded timeout of {int(timeout_seconds)} seconds "
+                                f"for tool '{name}'."
+                            ),
+                            hint="Increase REFUA_MCP_TASK_TIMEOUT_SECONDS or reduce workload.",
+                            retryable=True,
                         )
-                    ],
-                    isError=True,
-                )
+                        _cancel_job(job_id, reason=timeout_error)
+                        return _error_call_tool_result(timeout_error)
 
-            if status == "queued":
-                queue_position = snapshot.get("queue_position")
-                if queue_position is not None:
-                    await task_context.update_status(f"queued ({queue_position} ahead)")
-            elif status == "running":
-                eta = snapshot.get("estimated_remaining_seconds")
-                if isinstance(eta, (float, int)):
-                    await task_context.update_status(
-                        f"running (~{max(0, int(round(float(eta))))}s remaining)"
+                    if status == "queued":
+                        queue_position = snapshot.get("queue_position")
+                        if queue_position is not None:
+                            await task_context.update_status(
+                                f"queued ({queue_position} ahead)"
+                            )
+                    elif status == "running":
+                        eta = snapshot.get("estimated_remaining_seconds")
+                        if isinstance(eta, (float, int)):
+                            await task_context.update_status(
+                                f"running (~{max(0, int(round(float(eta))))}s remaining)"
+                            )
+                        else:
+                            await task_context.update_status("running")
+
+                    await anyio.sleep(
+                        _long_poll_sleep_seconds(snapshot, LONG_POLL_MAX_SLEEP_SECONDS),
                     )
-                else:
-                    await task_context.update_status("running")
-
-            await anyio.sleep(
-                _long_poll_sleep_seconds(snapshot, LONG_POLL_MAX_SLEEP_SECONDS),
-            )
+            finally:
+                if task_id:
+                    _unregister_task_job(task_id, job_id)
 
     return await experimental.run_task(
         work,
@@ -819,6 +1351,156 @@ def _normalize_admet_task_ids(
     if not normalized:
         raise ValueError("task_ids cannot be empty.")
     return normalized
+
+
+def _normalize_string_list_arg(
+    value: list[str] | tuple[str, ...] | str | None,
+    *,
+    field_name: str,
+) -> list[str] | None:
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError(f"{field_name} cannot be an empty string.")
+        parsed: Any = text
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"{field_name} must be valid JSON when provided as a list string."
+                ) from exc
+        if isinstance(parsed, str):
+            items = [part.strip() for part in parsed.split(",") if part.strip()]
+            if not items:
+                raise ValueError(f"{field_name} cannot be empty.")
+            return items
+        value = parsed
+
+    if isinstance(value, (list, tuple)):
+        normalized = [str(item).strip() for item in value if str(item).strip()]
+        if not normalized:
+            raise ValueError(f"{field_name} cannot be empty.")
+        return normalized
+
+    raise ValueError(f"{field_name} must be a string or list of strings.")
+
+
+def _resolve_refua_protein_property_api() -> (
+    tuple[Any, Callable[[], Any], Callable[[], Any]]
+):
+    try:
+        import refua as refua_pkg
+    except Exception as exc:
+        raise ValueError(
+            "Protein properties API is unavailable. Install/upgrade refua first."
+        ) from exc
+
+    protein_properties_cls = getattr(refua_pkg, "ProteinProperties", None)
+    available_properties_fn = getattr(refua_pkg, "available_protein_properties", None)
+    available_groups_fn = getattr(refua_pkg, "available_protein_property_groups", None)
+
+    if protein_properties_cls is None or available_properties_fn is None:
+        try:
+            from refua.protein import (  # noqa: PLC0415
+                ProteinProperties,
+                available_protein_properties,
+            )
+        except Exception as exc:
+            raise ValueError(
+                "Protein properties API is unavailable in this refua build. "
+                "Upgrade to a version that includes ProteinProperties."
+            ) from exc
+        protein_properties_cls = ProteinProperties
+        available_properties_fn = available_protein_properties
+
+    if available_groups_fn is None:
+        available_groups_fn = lambda: ()
+
+    return (
+        protein_properties_cls,
+        available_properties_fn,
+        available_groups_fn,
+    )
+
+
+def _protein_property_catalog() -> (
+    tuple[list[str], list[str], dict[str, dict[str, Any]]]
+):
+    fallback_names = [
+        "length",
+        "molecular_weight",
+        "isoelectric_point",
+        "gravy",
+        "net_charge_ph_7_4",
+    ]
+    fallback_groups = ["basic", "charge", "biophysical"]
+    fallback_specs = {
+        "length": {"description": "Sequence length in residues.", "groups": ["basic"]},
+        "molecular_weight": {
+            "description": "Estimated molecular weight in Daltons.",
+            "groups": ["basic"],
+        },
+        "isoelectric_point": {
+            "description": "Estimated isoelectric point (pI).",
+            "groups": ["basic", "charge"],
+        },
+        "gravy": {
+            "description": "Grand average of hydropathy.",
+            "groups": ["basic", "biophysical"],
+        },
+        "net_charge_ph_7_4": {
+            "description": "Estimated net charge at pH 7.4.",
+            "groups": ["charge"],
+        },
+    }
+
+    try:
+        (
+            _protein_properties_cls,
+            available_properties_fn,
+            available_groups_fn,
+        ) = _resolve_refua_protein_property_api()
+        names = sorted(str(name) for name in available_properties_fn())
+        groups = sorted(str(group) for group in available_groups_fn())
+    except Exception:
+        return fallback_names, fallback_groups, fallback_specs
+
+    specs_payload: dict[str, dict[str, Any]] = {}
+    try:
+        from refua.protein import protein_property_specs  # noqa: PLC0415
+
+        for name, spec in protein_property_specs().items():
+            specs_payload[str(name)] = {
+                "description": str(getattr(spec, "description", "")),
+                "groups": sorted(str(group) for group in getattr(spec, "groups", ())),
+            }
+    except Exception:
+        for name in names:
+            specs_payload[name] = {"description": "", "groups": []}
+
+    for name in names:
+        specs_payload.setdefault(name, {"description": "", "groups": []})
+    return names, groups, specs_payload
+
+
+def _completion_values(
+    candidates: list[str],
+    *,
+    partial: str,
+    limit: int = 100,
+) -> Completion:
+    needle = partial.strip().lower()
+    if needle:
+        values = [item for item in candidates if item.lower().startswith(needle)]
+    else:
+        values = list(candidates)
+    total = len(values)
+    sliced = values[:limit]
+    return Completion(values=sliced, total=total, hasMore=total > len(sliced))
 
 
 def _build_boltz2_from_options(options: Mapping[str, Any] | None) -> Boltz2:
@@ -1633,51 +2315,125 @@ def _prune_jobs_locked() -> None:
     for job_id, job in list(_JOB_STORE.items()):
         if len(_JOB_STORE) <= JOB_HISTORY_LIMIT:
             break
-        if job.status in {"success", "error"}:
+        if job.status in {"success", "error", "cancelled"}:
             _JOB_STORE.pop(job_id, None)
 
 
 def _run_job(job_id: str, runner: Callable[[], dict[str, Any]]) -> None:
-    with _JOB_LOCK:
-        job = _JOB_STORE.get(job_id)
-        if job is None:
-            return
-        job.status = "running"
-        job.started_at = time.time()
-
-    try:
-        result = runner()
-    except Exception:
-        err = traceback.format_exc()
+    attributes: dict[str, Any] = {"job_id": job_id}
+    with _trace_span("refua.job.run", **attributes):
         with _JOB_LOCK:
             job = _JOB_STORE.get(job_id)
             if job is None:
                 return
-            job.status = "error"
-            job.error = err
-            job.finished_at = time.time()
-        return
+            attributes["tool"] = job.tool
+            if job.cancel_requested or job.status == "cancelled":
+                if job.finished_at is None:
+                    job.finished_at = time.time()
+                return
 
-    with _JOB_LOCK:
-        job = _JOB_STORE.get(job_id)
-        if job is None:
+            now = time.time()
+            queue_timeout_seconds = _queue_timeout_seconds(job)
+            queued_for_seconds = max(0.0, now - job.created_at)
+            if queue_timeout_seconds > 0 and queued_for_seconds > queue_timeout_seconds:
+                job.status = "error"
+                job.error = _error_contract(
+                    code="queue_timeout",
+                    message=(
+                        f"Job exceeded queue timeout of {int(queue_timeout_seconds)} "
+                        f"seconds before execution."
+                    ),
+                    hint=(
+                        "Increase REFUA_MCP_QUEUE_TIMEOUT_SECONDS or reduce concurrent "
+                        "job volume."
+                    ),
+                    retryable=True,
+                    details={"queued_for_seconds": queued_for_seconds},
+                )
+                job.finished_at = now
+                _metric_add(_JOB_FAILED_COUNTER, 1, attributes={"tool": job.tool})
+                return
+
+            job.status = "running"
+            job.started_at = now
+
+        started_at = time.time()
+        try:
+            with _trace_span("refua.job.runner", **attributes):
+                result = runner()
+        except Exception as exc:
+            with _JOB_LOCK:
+                job = _JOB_STORE.get(job_id)
+                if job is None:
+                    return
+                if job.status == "cancelled" or job.cancel_requested:
+                    if job.finished_at is None:
+                        job.finished_at = time.time()
+                    return
+                job.status = "error"
+                job.error = _error_contract_from_exception(exc)
+                job.finished_at = time.time()
+            _metric_add(
+                _JOB_FAILED_COUNTER,
+                1,
+                attributes={"tool": attributes.get("tool", "unknown")},
+            )
+            _metric_record(
+                _JOB_RUNTIME_HISTOGRAM,
+                max(0.0, time.time() - started_at),
+                attributes={
+                    "tool": attributes.get("tool", "unknown"),
+                    "status": "error",
+                },
+            )
             return
-        job.status = "success"
-        job.result = result
-        job.finished_at = time.time()
+
+        with _JOB_LOCK:
+            job = _JOB_STORE.get(job_id)
+            if job is None:
+                return
+            if job.status == "cancelled" or job.cancel_requested:
+                if job.finished_at is None:
+                    job.finished_at = time.time()
+                return
+            job.status = "success"
+            job.result = result
+            job.finished_at = time.time()
+
+        _metric_add(
+            _JOB_COMPLETED_COUNTER,
+            1,
+            attributes={"tool": attributes.get("tool", "unknown")},
+        )
+        _metric_record(
+            _JOB_RUNTIME_HISTOGRAM,
+            max(0.0, time.time() - started_at),
+            attributes={"tool": attributes.get("tool", "unknown"), "status": "success"},
+        )
 
 
-def _submit_job(tool: str, runner: Callable[[], dict[str, Any]]) -> str:
+def _submit_job(
+    tool: str,
+    runner: Callable[[], dict[str, Any]],
+    *,
+    queue_timeout_seconds: float | None = None,
+) -> str:
     job_id = uuid.uuid4().hex
     record = JobRecord(
         job_id=job_id,
         tool=tool,
         status="queued",
         created_at=time.time(),
+        queue_timeout_seconds=queue_timeout_seconds,
     )
     with _JOB_LOCK:
         _JOB_STORE[job_id] = record
+        queue_depth = _queue_depth_locked()
         _prune_jobs_locked()
+    _metric_add(_JOB_SUBMITTED_COUNTER, 1, attributes={"tool": tool})
+    _metric_record(
+        _JOB_QUEUE_DEPTH_HISTOGRAM, float(queue_depth), attributes={"tool": tool}
+    )
     _JOB_EXECUTOR.submit(_run_job, job_id, runner)
     return job_id
 
@@ -1696,6 +2452,7 @@ def _job_snapshot(job_id: str, include_result: bool) -> dict[str, Any]:
             "started_at": job.started_at,
             "finished_at": job.finished_at,
             "result_available": job.status == "success",
+            "cancel_requested": job.cancel_requested,
         }
         if job.status in {"queued", "running"}:
             queue_position = _queue_position_locked(job_id)
@@ -1720,7 +2477,12 @@ def _job_snapshot(job_id: str, include_result: bool) -> dict[str, Any]:
                 estimate_seconds,
                 queue_position,
             )
-        if job.status == "error" and job.error:
+            _metric_record(
+                _JOB_QUEUE_DEPTH_HISTOGRAM,
+                float(queue_depth),
+                attributes={"tool": job.tool},
+            )
+        if job.status in {"error", "cancelled"} and job.error:
             snapshot["error"] = job.error
         if include_result and job.status == "success":
             snapshot["result"] = job.result
@@ -1902,213 +2664,244 @@ def _run_complex_operation(
     feature_output_format: str | None,
     output_warnings: list[str] | None = None,
 ) -> dict[str, Any]:
-    boltz_opts = _parse_boltz_options(boltz)
-    boltzgen_opts = _parse_boltzgen_options(boltzgen)
-    admet_mode, admet_opts = _parse_admet_options(admet)
-
-    entity_types, _, ligand_specs, _ = _analyze_entities(entities)
-    action_value, run_boltz_local, run_boltzgen_local = _resolve_execution_modes(
+    with _trace_span(
+        "refua.run_complex_operation",
         action=action,
-        entity_types=entity_types,
-        constraints=constraints,
-        affinity=affinity,
-        run_boltz=run_boltz,
-        run_boltzgen=run_boltzgen,
-    )
+        entity_count=len(entities),
+        request_name=name,
+    ):
+        boltz_opts = _parse_boltz_options(boltz)
+        boltzgen_opts = _parse_boltzgen_options(boltzgen)
+        admet_mode, admet_opts = _parse_admet_options(admet)
 
-    boltz_model = None
-    if run_boltz_local or action_value == "affinity":
-        boltz_model = _build_boltz2_from_options(boltz_opts)
+        entity_types, _, ligand_specs, _ = _analyze_entities(entities)
+        action_value, run_boltz_local, run_boltzgen_local = _resolve_execution_modes(
+            action=action,
+            entity_types=entity_types,
+            constraints=constraints,
+            affinity=affinity,
+            run_boltz=run_boltz,
+            run_boltzgen=run_boltzgen,
+        )
 
-    has_ccd = any(
-        str(item.get("type", "")).lower() == "ligand" and item.get("ccd") is not None
-        for item in entities
-    )
-    boltz_mol_dir = None
-    if has_ccd:
-        boltz_mol_dir = _resolve_boltz_mol_dir(boltz_model, boltz_opts)
-        if boltz_mol_dir is None or not boltz_mol_dir.exists():
-            raise FileNotFoundError(
-                "CCD ligands require Boltz2 molecule assets. "
-                "Set boltz.cache_dir or enable run_boltz with auto_download."
+        boltz_model = None
+        if run_boltz_local or action_value == "affinity":
+            boltz_model = _build_boltz2_from_options(boltz_opts)
+
+        has_ccd = any(
+            str(item.get("type", "")).lower() == "ligand"
+            and item.get("ccd") is not None
+            for item in entities
+        )
+        boltz_mol_dir = None
+        if has_ccd:
+            boltz_mol_dir = _resolve_boltz_mol_dir(boltz_model, boltz_opts)
+            if boltz_mol_dir is None or not boltz_mol_dir.exists():
+                raise FileNotFoundError(
+                    "CCD ligands require Boltz2 molecule assets. "
+                    "Set boltz.cache_dir or enable run_boltz with auto_download."
+                )
+
+        with _trace_span("refua.build_complex_from_spec", entity_count=len(entities)):
+            complex_spec, ligand_alias_map, _, _ = _build_complex_from_spec(
+                name=name,
+                base_dir=base_dir,
+                entities=entities,
+                boltz_mol_dir=boltz_mol_dir,
             )
 
-    complex_spec, ligand_alias_map, _, _ = _build_complex_from_spec(
-        name=name,
-        base_dir=base_dir,
-        entities=entities,
-        boltz_mol_dir=boltz_mol_dir,
-    )
+        _apply_constraints(complex_spec, constraints, ligand_alias_map)
 
-    _apply_constraints(complex_spec, constraints, ligand_alias_map)
-
-    admet_output: dict[str, Any] | None = None
-    if admet_mode != "off":
-        has_smiles_ligands = bool(ligand_specs)
-        wants_admet = admet_mode == "on" or (
-            admet_mode == "auto" and has_smiles_ligands
-        )
-        if wants_admet:
-            if not _ADMET_AVAILABLE:
-                if admet_mode == "on":
-                    raise ValueError(
-                        "ADMET requested but refua[admet] is not installed."
-                    )
-                admet_output = {
-                    "status": "unavailable",
-                    "reason": "Install refua[admet] to enable ADMET predictions.",
-                }
-            else:
-                requested = _normalize_admet_ligands(admet_opts.get("ligands"))
-                targets = _select_admet_ligands(
-                    ligand_specs,
-                    requested,
-                    ligand_alias_map,
-                )
-                if not targets:
+        admet_output: dict[str, Any] | None = None
+        if admet_mode != "off":
+            has_smiles_ligands = bool(ligand_specs)
+            wants_admet = admet_mode == "on" or (
+                admet_mode == "auto" and has_smiles_ligands
+            )
+            if wants_admet:
+                if not _ADMET_AVAILABLE:
                     if admet_mode == "on":
                         raise ValueError(
-                            "ADMET requested but no SMILES ligands are available."
+                            "ADMET requested but refua[admet] is not installed."
                         )
+                    admet_output = {
+                        "status": "unavailable",
+                        "reason": "Install refua[admet] to enable ADMET predictions.",
+                    }
                 else:
-                    normalized_tasks = _normalize_admet_task_ids(
-                        admet_opts.get("task_ids")
+                    requested = _normalize_admet_ligands(admet_opts.get("ligands"))
+                    targets = _select_admet_ligands(
+                        ligand_specs,
+                        requested,
+                        ligand_alias_map,
                     )
-                    model_variant = str(admet_opts.get("model_variant", "9b-chat"))
-                    max_new_tokens = int(admet_opts.get("max_new_tokens", 8))
-                    include_scoring = bool(admet_opts.get("include_scoring", True))
-                    results = []
-                    for target in targets:
-                        profile = _admet_analyze(
-                            smiles=target["smiles"],
-                            model_variant=model_variant,
-                            max_new_tokens=max_new_tokens,
-                            include_scoring=include_scoring,
-                            task_ids=normalized_tasks,
+                    if not targets:
+                        if admet_mode == "on":
+                            raise ValueError(
+                                "ADMET requested but no SMILES ligands are available."
+                            )
+                    else:
+                        normalized_tasks = _normalize_admet_task_ids(
+                            admet_opts.get("task_ids")
                         )
-                        profile["ligand_id"] = target["ligand_id"]
-                        results.append(profile)
-                    admet_output = {"status": "success", "results": results}
+                        model_variant = str(admet_opts.get("model_variant", "9b-chat"))
+                        max_new_tokens = int(admet_opts.get("max_new_tokens", 8))
+                        include_scoring = bool(admet_opts.get("include_scoring", True))
+                        results = []
+                        with _trace_span(
+                            "refua.admet.batch", ligand_count=len(targets)
+                        ):
+                            for target in targets:
+                                profile = _admet_analyze(
+                                    smiles=target["smiles"],
+                                    model_variant=model_variant,
+                                    max_new_tokens=max_new_tokens,
+                                    include_scoring=include_scoring,
+                                    task_ids=normalized_tasks,
+                                )
+                                profile["ligand_id"] = target["ligand_id"]
+                                results.append(profile)
+                        admet_output = {"status": "success", "results": results}
 
-    affinity_requested, affinity_binder = _resolve_affinity_request(
-        affinity, ligand_alias_map
-    )
-
-    if action_value == "affinity":
-        affinity_result = complex_spec.affinity(
-            binder=affinity_binder,
-            boltz=boltz_model,
+        affinity_requested, affinity_binder = _resolve_affinity_request(
+            affinity, ligand_alias_map
         )
-        output: dict[str, Any] = {
+
+        if action_value == "affinity":
+            with _trace_span("refua.affinity.run"):
+                affinity_result = complex_spec.affinity(
+                    binder=affinity_binder,
+                    boltz=boltz_model,
+                )
+            output: dict[str, Any] = {
+                "name": name,
+                "binder": affinity_binder,
+                "affinity": _affinity_to_dict(affinity_result),
+            }
+            if ligand_alias_map:
+                output["ligand_id_map"] = ligand_alias_map
+            if admet_output is not None:
+                output["admet"] = admet_output
+            return output
+
+        if affinity_requested:
+            complex_spec.request_affinity(affinity_binder)
+
+        boltzgen_model = None
+        if run_boltzgen_local:
+            boltzgen_model = _build_boltzgen_from_options(boltzgen_opts)
+
+        with _trace_span(
+            "refua.fold.run",
+            run_boltz=run_boltz_local,
+            run_boltzgen=run_boltzgen_local,
+        ):
+            result = complex_spec.fold(
+                boltz=boltz_model,
+                boltzgen=boltzgen_model,
+                run_boltz=run_boltz_local,
+                run_boltzgen=run_boltzgen_local,
+            )
+
+        output = {
             "name": name,
-            "binder": affinity_binder,
-            "affinity": _affinity_to_dict(affinity_result),
+            "backend": result.backend,
+            "chain_ids": result.chain_ids,
+            "binder_sequences": result.binder_sequences,
         }
+        if output_warnings:
+            output["warnings"] = list(output_warnings)
         if ligand_alias_map:
             output["ligand_id_map"] = ligand_alias_map
         if admet_output is not None:
             output["admet"] = admet_output
+
+        if result.affinity is not None:
+            output["affinity"] = _affinity_to_dict(result.affinity)
+
+        if result.structure is None:
+            if structure_output_path or return_mmcif or return_bcif_base64:
+                raise ValueError(
+                    "Structure output requested but no structure was produced."
+                )
+        else:
+            output_kind = _resolve_output_format(
+                structure_output_path,
+                structure_output_format,
+            )
+            if output_kind is None and structure_output_path is not None:
+                output_kind = "cif"
+
+            mmcif_text = None
+            bcif_bytes = None
+            if output_kind == "cif" or return_mmcif:
+                mmcif_text = result.to_mmcif()
+            if output_kind == "bcif" or return_bcif_base64:
+                bcif_bytes = result.to_bcif()
+
+            output_written = None
+            if structure_output_path and output_kind:
+                output_written = _write_structure(
+                    output_path=structure_output_path,
+                    output_format=output_kind,
+                    mmcif_text=mmcif_text,
+                    bcif_bytes=bcif_bytes,
+                )
+
+            structure_info: dict[str, Any] = {
+                "confidence_score": result.structure.confidence_score,
+                "output_path": output_written,
+                "output_format": output_kind,
+            }
+            if return_mmcif and mmcif_text is not None:
+                structure_info["mmcif"] = mmcif_text
+            if return_bcif_base64 and bcif_bytes is not None:
+                structure_info["bcif_base64"] = base64.b64encode(bcif_bytes).decode(
+                    "ascii"
+                )
+            output["structure"] = structure_info
+
+        features = result.features
+        if features is None:
+            if feature_output_path:
+                raise ValueError(
+                    "Feature output requested but no features were produced."
+                )
+        else:
+            features = dict(features)
+            feature_format = None
+            output_written = None
+            if feature_output_path:
+                feature_format = _resolve_feature_output_format(
+                    feature_output_path,
+                    feature_output_format,
+                )
+                output_written = _save_features(
+                    output_path=feature_output_path,
+                    output_format=feature_format,
+                    features=features,
+                )
+            output["features"] = {
+                "feature_keys": sorted(features.keys()),
+                "feature_shapes": _summarize_features(features),
+                "output_path": output_written,
+                "output_format": feature_format,
+            }
+
         return output
 
-    if affinity_requested:
-        complex_spec.request_affinity(affinity_binder)
 
-    boltzgen_model = None
-    if run_boltzgen_local:
-        boltzgen_model = _build_boltzgen_from_options(boltzgen_opts)
-
-    result = complex_spec.fold(
-        boltz=boltz_model,
-        boltzgen=boltzgen_model,
-        run_boltz=run_boltz_local,
-        run_boltzgen=run_boltzgen_local,
+def _queue_job(
+    tool_name: str,
+    runner: Callable[[], BaseModel],
+    *,
+    queue_timeout_seconds: float | None = None,
+) -> QueuedJobResponse:
+    job_id = _submit_job(
+        tool_name,
+        lambda: runner().model_dump(mode="json"),
+        queue_timeout_seconds=queue_timeout_seconds,
     )
-
-    output = {
-        "name": name,
-        "backend": result.backend,
-        "chain_ids": result.chain_ids,
-        "binder_sequences": result.binder_sequences,
-    }
-    if output_warnings:
-        output["warnings"] = list(output_warnings)
-    if ligand_alias_map:
-        output["ligand_id_map"] = ligand_alias_map
-    if admet_output is not None:
-        output["admet"] = admet_output
-
-    if result.affinity is not None:
-        output["affinity"] = _affinity_to_dict(result.affinity)
-
-    if result.structure is None:
-        if structure_output_path or return_mmcif or return_bcif_base64:
-            raise ValueError(
-                "Structure output requested but no structure was produced."
-            )
-    else:
-        output_kind = _resolve_output_format(
-            structure_output_path, structure_output_format
-        )
-        if output_kind is None and structure_output_path is not None:
-            output_kind = "cif"
-
-        mmcif_text = None
-        bcif_bytes = None
-        if output_kind == "cif" or return_mmcif:
-            mmcif_text = result.to_mmcif()
-        if output_kind == "bcif" or return_bcif_base64:
-            bcif_bytes = result.to_bcif()
-
-        output_written = None
-        if structure_output_path and output_kind:
-            output_written = _write_structure(
-                output_path=structure_output_path,
-                output_format=output_kind,
-                mmcif_text=mmcif_text,
-                bcif_bytes=bcif_bytes,
-            )
-
-        structure_info: dict[str, Any] = {
-            "confidence_score": result.structure.confidence_score,
-            "output_path": output_written,
-            "output_format": output_kind,
-        }
-        if return_mmcif and mmcif_text is not None:
-            structure_info["mmcif"] = mmcif_text
-        if return_bcif_base64 and bcif_bytes is not None:
-            structure_info["bcif_base64"] = base64.b64encode(bcif_bytes).decode("ascii")
-        output["structure"] = structure_info
-
-    features = result.features
-    if features is None:
-        if feature_output_path:
-            raise ValueError("Feature output requested but no features were produced.")
-    else:
-        features = dict(features)
-        feature_format = None
-        output_written = None
-        if feature_output_path:
-            feature_format = _resolve_feature_output_format(
-                feature_output_path,
-                feature_output_format,
-            )
-            output_written = _save_features(
-                output_path=feature_output_path,
-                output_format=feature_format,
-                features=features,
-            )
-        output["features"] = {
-            "feature_keys": sorted(features.keys()),
-            "feature_shapes": _summarize_features(features),
-            "output_path": output_written,
-            "output_format": feature_format,
-        }
-
-    return output
-
-
-def _queue_job(tool_name: str, runner: Callable[[], BaseModel]) -> QueuedJobResponse:
-    job_id = _submit_job(tool_name, lambda: runner().model_dump(mode="json"))
     return QueuedJobResponse(job_id=job_id)
 
 
@@ -2133,6 +2926,7 @@ def refua_fold(
     feature_output_format: FeatureOutputFormatArg = None,
     allow_exploratory_run: bool = False,
     async_mode: bool = False,
+    queue_timeout_seconds: float | None = None,
 ) -> FoldResult | QueuedJobResponse:
     """Run Refua fold/design workflows with strict typed inputs."""
 
@@ -2185,7 +2979,11 @@ def refua_fold(
         return FoldResult.model_validate(output)
 
     if async_mode:
-        return _queue_job("refua_fold", run)
+        return _queue_job(
+            "refua_fold",
+            run,
+            queue_timeout_seconds=queue_timeout_seconds,
+        )
     return run()
 
 
@@ -2199,6 +2997,7 @@ def refua_affinity(
     boltz: BoltzOptions | None = None,
     admet: AdmetArg = None,
     async_mode: bool = False,
+    queue_timeout_seconds: float | None = None,
 ) -> AffinityResultResponse | QueuedJobResponse:
     """Run affinity-only predictions with strict typed inputs."""
 
@@ -2233,7 +3032,11 @@ def refua_affinity(
         return AffinityResultResponse.model_validate(output)
 
     if async_mode:
-        return _queue_job("refua_affinity", run)
+        return _queue_job(
+            "refua_affinity",
+            run,
+            queue_timeout_seconds=queue_timeout_seconds,
+        )
     return run()
 
 
@@ -2259,6 +3062,7 @@ def refua_antibody_design(
     feature_output_format: FeatureOutputFormatArg = None,
     allow_exploratory_run: bool = False,
     async_mode: bool = False,
+    queue_timeout_seconds: float | None = None,
 ) -> FoldResult | QueuedJobResponse:
     """Design/fold with an explicit antibody entrypoint plus optional context entities."""
 
@@ -2313,7 +3117,11 @@ def refua_antibody_design(
         return FoldResult.model_validate(output)
 
     if async_mode:
-        return _queue_job("refua_antibody_design", run)
+        return _queue_job(
+            "refua_antibody_design",
+            run,
+            queue_timeout_seconds=queue_timeout_seconds,
+        )
     return run()
 
 
@@ -2339,26 +3147,27 @@ def refua_validate_spec(
 ) -> ValidateSpecResult:
     """Validate and normalize a request without running fold/affinity inference."""
 
-    normalized_entities = _normalize_entities_arg(entities)
-    normalized_constraints = _normalize_constraints_arg(constraints)
-    (
-        normalized_structure_output_path,
-        normalized_structure_output_format,
-        normalized_feature_output_path,
-        normalized_feature_output_format,
-        output_warnings,
-    ) = _normalize_output_requests(
-        structure_output_path=structure_output_path,
-        structure_output_format=structure_output_format,
-        feature_output_path=feature_output_path,
-        feature_output_format=feature_output_format,
-    )
-    entities_payload = _entities_to_payload(normalized_entities)
-    constraints_payload = _constraints_to_payload(normalized_constraints)
-    affinity_payload = _normalize_affinity_arg(affinity)
-    boltz_payload = _model_dict(boltz)
-    boltzgen_payload = _model_dict(boltzgen)
-    admet_payload = _normalize_admet_arg(admet)
+    with _trace_span("refua.validate_spec.parse"):
+        normalized_entities = _normalize_entities_arg(entities)
+        normalized_constraints = _normalize_constraints_arg(constraints)
+        (
+            normalized_structure_output_path,
+            normalized_structure_output_format,
+            normalized_feature_output_path,
+            normalized_feature_output_format,
+            output_warnings,
+        ) = _normalize_output_requests(
+            structure_output_path=structure_output_path,
+            structure_output_format=structure_output_format,
+            feature_output_path=feature_output_path,
+            feature_output_format=feature_output_format,
+        )
+        entities_payload = _entities_to_payload(normalized_entities)
+        constraints_payload = _constraints_to_payload(normalized_constraints)
+        affinity_payload = _normalize_affinity_arg(affinity)
+        boltz_payload = _model_dict(boltz)
+        boltzgen_payload = _model_dict(boltzgen)
+        admet_payload = _normalize_admet_arg(admet)
 
     boltz_opts = _parse_boltz_options(boltz_payload)
     _parse_boltzgen_options(boltzgen_payload)
@@ -2399,33 +3208,37 @@ def refua_validate_spec(
         raise ValueError("ADMET requested but no SMILES ligands are available.")
 
     if deep_validate:
-        has_ccd = any(
-            str(item.get("type", "")).lower() == "ligand"
-            and item.get("ccd") is not None
-            for item in entities_payload
-        )
-        should_deep_validate = True
-        boltz_mol_dir = None
-        if has_ccd:
-            candidate_mol_dir = _resolve_boltz_mol_dir(None, boltz_opts)
-            if candidate_mol_dir is None or not candidate_mol_dir.exists():
-                should_deep_validate = False
-                warnings.append(
-                    "Skipped deep CCD ligand validation because Boltz molecule assets "
-                    "are not available locally."
-                )
-            else:
-                boltz_mol_dir = candidate_mol_dir
-
-        if should_deep_validate:
-            complex_spec, deep_alias_map, _, _ = _build_complex_from_spec(
-                name=name,
-                base_dir=base_dir,
-                entities=entities_payload,
-                boltz_mol_dir=boltz_mol_dir,
+        with _trace_span(
+            "refua.validate_spec.deep_validate",
+            entity_count=len(entities_payload),
+        ):
+            has_ccd = any(
+                str(item.get("type", "")).lower() == "ligand"
+                and item.get("ccd") is not None
+                for item in entities_payload
             )
-            ligand_alias_map = deep_alias_map
-            _apply_constraints(complex_spec, constraints_payload, ligand_alias_map)
+            should_deep_validate = True
+            boltz_mol_dir = None
+            if has_ccd:
+                candidate_mol_dir = _resolve_boltz_mol_dir(None, boltz_opts)
+                if candidate_mol_dir is None or not candidate_mol_dir.exists():
+                    should_deep_validate = False
+                    warnings.append(
+                        "Skipped deep CCD ligand validation because Boltz molecule assets "
+                        "are not available locally."
+                    )
+                else:
+                    boltz_mol_dir = candidate_mol_dir
+
+            if should_deep_validate:
+                complex_spec, deep_alias_map, _, _ = _build_complex_from_spec(
+                    name=name,
+                    base_dir=base_dir,
+                    entities=entities_payload,
+                    boltz_mol_dir=boltz_mol_dir,
+                )
+                ligand_alias_map = deep_alias_map
+                _apply_constraints(complex_spec, constraints_payload, ligand_alias_map)
     else:
         warnings.append(
             "Deep entity construction checks were skipped. Set deep_validate=true "
@@ -2465,6 +3278,230 @@ def refua_validate_spec(
         ),
         warnings=warnings,
     )
+
+
+@mcp.tool()
+def refua_protein_properties(
+    sequence: str,
+    *,
+    properties: list[str] | tuple[str, ...] | str | None = None,
+    groups: list[str] | tuple[str, ...] | str | None = None,
+    lazy: bool = True,
+    sanitize: bool = True,
+    include_catalog: bool = False,
+) -> ProteinPropertiesResult:
+    """Compute protein properties from sequence with Refua's ProteinProperties API."""
+    sequence_value = str(sequence or "").strip()
+    if not sequence_value:
+        raise ValueError("sequence is required.")
+
+    selected_properties = _normalize_string_list_arg(
+        properties,
+        field_name="properties",
+    )
+    selected_groups = _normalize_string_list_arg(
+        groups,
+        field_name="groups",
+    )
+    if selected_properties is not None and selected_groups is not None:
+        raise ValueError("Provide either properties or groups, not both.")
+
+    (
+        protein_properties_cls,
+        available_properties_fn,
+        available_groups_fn,
+    ) = _resolve_refua_protein_property_api()
+
+    builder = protein_properties_cls.from_sequence(
+        sequence_value,
+        lazy=bool(lazy),
+        sanitize=bool(sanitize),
+    )
+
+    if selected_properties is not None:
+        values: dict[str, Any] = {
+            prop_name: builder.get(prop_name) for prop_name in selected_properties
+        }
+    elif selected_groups is not None:
+        values = dict(builder.to_dict(groups=selected_groups))
+    else:
+        values = dict(builder.to_dict())
+
+    available_properties: list[str] | None = None
+    available_property_groups: list[str] | None = None
+    if include_catalog:
+        available_properties = sorted(str(name) for name in available_properties_fn())
+        available_property_groups = sorted(
+            str(group) for group in available_groups_fn()
+        )
+
+    normalized_sequence = str(getattr(builder, "sequence", sequence_value))
+    return ProteinPropertiesResult(
+        sequence=sequence_value,
+        normalized_sequence=normalized_sequence,
+        values=values,
+        selected_properties=selected_properties,
+        selected_groups=selected_groups,
+        available_properties=available_properties,
+        available_property_groups=available_property_groups,
+    )
+
+
+def _capabilities_payload() -> dict[str, Any]:
+    try:
+        _resolve_refua_protein_property_api()
+        protein_property_api = True
+    except Exception:
+        protein_property_api = False
+    property_names, property_groups, _ = _protein_property_catalog()
+
+    return {
+        "mcp_spec_revision": MCP_SPEC_REVISION,
+        "mcp_latest_protocol_version": str(LATEST_PROTOCOL_VERSION),
+        "mcp_sdk_version": _MCP_SDK_VERSION,
+        "refua_version": _REFUA_VERSION,
+        "runtime": {
+            "transport": _RUNTIME_CONFIG.transport,
+            "host": _RUNTIME_CONFIG.host,
+            "port": _RUNTIME_CONFIG.port,
+            "mount_path": _RUNTIME_CONFIG.mount_path,
+            "task_timeout_seconds": _RUNTIME_CONFIG.task_timeout_seconds,
+            "queue_timeout_seconds": _RUNTIME_CONFIG.queue_timeout_seconds,
+            "dns_rebinding_protection": _RUNTIME_CONFIG.enable_dns_rebinding_protection,
+            "allowed_hosts": list(_RUNTIME_CONFIG.allowed_hosts),
+            "allowed_origins": list(_RUNTIME_CONFIG.allowed_origins),
+            "auth_enabled": bool(_RUNTIME_CONFIG.token_count),
+            "auth_token_count": _RUNTIME_CONFIG.token_count,
+        },
+        "features": {
+            "admet_available": _ADMET_AVAILABLE,
+            "protein_properties_api_available": protein_property_api,
+            "otel_available": _OTEL_AVAILABLE,
+            "experimental_tasks_enabled": True,
+        },
+        "task_support_by_tool": {
+            tool_name: _task_support_mode(tool_name)
+            for tool_name in _TASK_SUPPORT_BY_TOOL
+        },
+        "protein_property_counts": {
+            "properties": len(property_names),
+            "groups": len(property_groups),
+        },
+    }
+
+
+@mcp.resource(
+    "refua://capabilities",
+    name="refua_capabilities",
+    description="Runtime capabilities and feature flags for this Refua MCP server.",
+)
+def refua_capabilities() -> str:
+    return json.dumps(_capabilities_payload(), indent=2)
+
+
+@mcp.resource(
+    "refua://protein-properties/index",
+    name="refua_protein_property_index",
+    description="Index of protein property names/groups available through Refua.",
+)
+def refua_protein_property_index() -> str:
+    names, groups, _ = _protein_property_catalog()
+    return json.dumps(
+        {
+            "template_uris": [
+                "refua://protein-properties/group/{group_name}",
+                "refua://protein-properties/property/{property_name}",
+            ],
+            "property_names": names,
+            "property_groups": groups,
+            "count": {"properties": len(names), "groups": len(groups)},
+        },
+        indent=2,
+    )
+
+
+@mcp.resource(
+    "refua://protein-properties/group/{group_name}",
+    name="refua_protein_property_group",
+    description="Protein property names for a specific property group.",
+)
+def refua_protein_property_group(group_name: str) -> str:
+    names, groups, specs = _protein_property_catalog()
+    normalized = str(group_name).strip().lower()
+    if normalized not in {group.lower() for group in groups}:
+        raise ValueError(
+            f"Unknown protein property group '{group_name}'. Available: {groups}"
+        )
+    grouped = [
+        name
+        for name in names
+        if normalized
+        in {
+            str(group).strip().lower()
+            for group in specs.get(name, {}).get("groups", [])
+        }
+    ]
+    return json.dumps(
+        {
+            "group_name": normalized,
+            "properties": grouped,
+            "count": len(grouped),
+        },
+        indent=2,
+    )
+
+
+@mcp.resource(
+    "refua://protein-properties/property/{property_name}",
+    name="refua_protein_property_detail",
+    description="Property metadata for a single protein property name.",
+)
+def refua_protein_property_detail(property_name: str) -> str:
+    names, _groups, specs = _protein_property_catalog()
+    normalized = str(property_name).strip()
+    if normalized not in names:
+        raise ValueError(
+            f"Unknown protein property '{property_name}'. Available count: {len(names)}"
+        )
+    payload = {
+        "property_name": normalized,
+        "description": specs.get(normalized, {}).get("description", ""),
+        "groups": specs.get(normalized, {}).get("groups", []),
+    }
+    return json.dumps(payload, indent=2)
+
+
+@mcp.completion()
+async def refua_completion(
+    ref: PromptReference | ResourceTemplateReference,
+    argument: Any,
+    context: Any | None,
+) -> Completion | None:
+    del context
+    if isinstance(ref, PromptReference):
+        return None
+    ref_uri = str(ref.uri)
+    arg_name = str(argument.name)
+    partial = str(argument.value or "")
+
+    if ref_uri == "refua://recipes/{recipe_name}" and arg_name == "recipe_name":
+        return _completion_values(sorted(_RECIPE_LIBRARY), partial=partial)
+
+    if (
+        ref_uri == "refua://protein-properties/group/{group_name}"
+        and arg_name == "group_name"
+    ):
+        _names, groups, _specs = _protein_property_catalog()
+        return _completion_values(groups, partial=partial)
+
+    if (
+        ref_uri == "refua://protein-properties/property/{property_name}"
+        and arg_name == "property_name"
+    ):
+        names, _groups, _specs = _protein_property_catalog()
+        return _completion_values(names, partial=partial)
+
+    return None
 
 
 _RECIPE_LIBRARY: dict[str, dict[str, Any]] = {
@@ -2520,6 +3557,14 @@ _RECIPE_LIBRARY: dict[str, dict[str, Any]] = {
             ],
         },
     },
+    "protein_properties": {
+        "tool": "refua_protein_properties",
+        "args": {
+            "sequence": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ",
+            "groups": ["basic"],
+            "include_catalog": True,
+        },
+    },
 }
 
 
@@ -2560,6 +3605,7 @@ def refua_job(
     *,
     include_result: bool = False,
     wait_for_terminal_seconds: float | None = None,
+    cancel: bool = False,
 ) -> dict[str, Any]:
     """Check status for a background refua job.
 
@@ -2567,8 +3613,20 @@ def refua_job(
     queued or running jobs.
 
     wait_for_terminal_seconds optionally blocks until the job reaches a terminal state
-    (success/error) or the timeout is reached. Use this to reduce client-side polling.
+    (success/error/cancelled) or the timeout is reached. Use this to reduce
+    client-side polling.
     """
+    if cancel:
+        _cancel_job(
+            job_id,
+            reason=_error_contract(
+                code="job_cancelled",
+                message="Job cancelled by client request.",
+                hint="Resubmit the job if you still need the result.",
+                retryable=True,
+            ),
+        )
+
     if wait_for_terminal_seconds is None:
         return _job_snapshot(job_id, include_result)
     wait_seconds = float(wait_for_terminal_seconds)
@@ -2674,12 +3732,42 @@ def _configure_experimental_task_support() -> None:
     lowlevel.list_tools()(_list_tools_with_task_support)
     lowlevel.call_tool(validate_input=False)(_call_tool_with_task_support)
 
+    @lowlevel.experimental.cancel_task()
+    async def _cancel_task_with_job_cleanup(req: Any) -> Any:
+        from mcp.shared.experimental.tasks.helpers import cancel_task as mcp_cancel_task
+
+        support = lowlevel.experimental.task_support
+        if support is None:
+            raise RuntimeError("Task support is not enabled.")
+        result = await mcp_cancel_task(support.store, req.params.taskId)
+        mapped_job_id = _lookup_task_job(req.params.taskId)
+        if mapped_job_id is not None:
+            _cancel_job(
+                mapped_job_id,
+                reason=_error_contract(
+                    code="task_cancelled",
+                    message=f"Task '{req.params.taskId}' was cancelled by the client.",
+                    hint="Resubmit the task to run it again.",
+                    retryable=True,
+                ),
+            )
+            _unregister_task_job(req.params.taskId, mapped_job_id)
+        return result
+
 
 _configure_experimental_task_support()
 
 
 def main() -> None:
-    mcp.run()
+    run_mount_path = (
+        _RUNTIME_CONFIG.mount_path
+        if _RUNTIME_CONFIG.transport in {"sse", "streamable-http"}
+        else None
+    )
+    mcp.run(
+        transport=_RUNTIME_CONFIG.transport,
+        mount_path=run_mount_path,
+    )
 
 
 if __name__ == "__main__":
