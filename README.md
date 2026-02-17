@@ -17,6 +17,12 @@ ADMET predictions are optional; install `refua[admet]` to enable them:
 pip install refua[admet]
 ```
 
+Clinical trial simulation is optional; install the clinical extra:
+
+```bash
+pip install "refua-mcp[clinical]"
+```
+
 OpenTelemetry spans/metrics are optional:
 
 ```bash
@@ -101,6 +107,7 @@ Security/runtime controls:
 - `refua_protein_properties`: compute sequence-based protein properties via Refua's `ProteinProperties` API.
 - `refua_job`: check status/results for background jobs.
 - `refua_admet_profile` (optional): run model-based ADMET predictions for SMILES strings (requires `refua[admet]`).
+- `refua_clinical_simulator` (optional): run the `refua-clinical` simulator and optional workup (requires `refua-mcp[clinical]`).
 
 All major tools expose strict JSON schemas, including discriminated entity unions by `type` and typed output schemas.
 
@@ -140,6 +147,7 @@ Recipe names:
 - `affinity_only`
 - `antibody_design`
 - `protein_properties`
+- `clinical_simulation` (optional; available when `refua-clinical` is installed)
 
 ## Workflow
 
@@ -149,7 +157,7 @@ Recommended call sequence:
 2. Read `refua://capabilities` for runtime support and limits.
 3. For sequence-only property analysis, call `refua_protein_properties`.
 4. Call `refua_validate_spec` to catch schema/logic issues before expensive runs (`deep_validate=true` for asset-backed construction checks).
-5. Execute `refua_fold`, `refua_affinity`, or `refua_antibody_design`.
+5. Execute `refua_fold`, `refua_affinity`, `refua_antibody_design`, or `refua_clinical_simulator` (optional).
 6. For long runs, set `async_mode=true` and poll `refua_job`.
 
 ## Examples
@@ -250,6 +258,20 @@ Protein properties:
 }
 ```
 
+Clinical simulation (optional):
+
+```json
+{
+  "tool": "refua_clinical_simulator",
+  "args": {
+    "trial_id": "small_molecule_phase2",
+    "replicates": 80,
+    "include_workup": true,
+    "include_replicates": false
+  }
+}
+```
+
 Note: DNA/RNA entities are supported for Boltz2 folding only (BoltzGen does not accept DNA/RNA entities).
 
 ## Long-Running Jobs
@@ -303,7 +325,7 @@ Long-poll support:
 This server enables MCP experimental task support (`tasks/get`, `tasks/result`,
 `tasks/list`, `tasks/cancel`) and advertises task execution support for
 `refua_validate_spec`, `refua_fold`, `refua_affinity`, `refua_antibody_design`,
-and `refua_admet_profile`.
+and `refua_admet_profile`. `refua_clinical_simulator` is also task-enabled when installed.
 
 If your client supports task-augmented tool calls, prefer tasks for long-running
 operations. Task cancellation (`tasks/cancel`) is wired to background job cancellation.

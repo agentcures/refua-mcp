@@ -66,6 +66,7 @@ Recommended sequence:
    - `refua_fold` for structure/design folds
    - `refua_affinity` for affinity-only predictions
    - `refua_antibody_design` for antibody-heavy workflows
+   - `refua_clinical_simulator` for clinical trial simulation (optional extra)
 5) For long runs, set `async_mode=true` and poll `refua_job` using
    `recommended_poll_seconds` or `wait_for_terminal_seconds`.
 """
@@ -272,6 +273,11 @@ try:  # noqa: SIM105
 except PackageNotFoundError:
     _REFUA_VERSION = None
 
+try:  # noqa: SIM105
+    _REFUA_CLINICAL_VERSION = package_version("refua-clinical")
+except PackageNotFoundError:
+    _REFUA_CLINICAL_VERSION = None
+
 try:  # Optional observability dependency.
     from opentelemetry import metrics as otel_metrics  # type: ignore[reportMissingImports]
     from opentelemetry import trace as otel_trace  # type: ignore[reportMissingImports]
@@ -354,7 +360,24 @@ def _admet_available() -> bool:
     return all(_module_available(dep) for dep in ADMET_DEPENDENCIES)
 
 
+def _clinical_available() -> bool:
+    if not _module_available("refua_clinical"):
+        return False
+    try:
+        from refua_clinical import ClinicalStudy  # type: ignore[import-not-found]
+    except Exception:
+        return False
+    return hasattr(ClinicalStudy, "simulate")
+
+
+def _get_clinical_study_cls() -> Any:
+    from refua_clinical import ClinicalStudy  # type: ignore[import-not-found]
+
+    return ClinicalStudy
+
+
 _ADMET_AVAILABLE = _admet_available()
+_CLINICAL_AVAILABLE = _clinical_available()
 _PROBE_RUN_NAME_RE = re.compile(
     r"(sanity|probe|schema|smoke|dry[_\-\s]?run)",
     re.IGNORECASE,
@@ -865,6 +888,8 @@ _TASK_SUPPORT_BY_TOOL: dict[str, TaskExecutionMode] = {
     "refua_antibody_design": "optional",
     "refua_admet_profile": "optional",
 }
+if _CLINICAL_AVAILABLE:
+    _TASK_SUPPORT_BY_TOOL["refua_clinical_simulator"] = "optional"
 
 
 def _clamp_seconds(value: float, minimum: int, maximum: int) -> int:
@@ -1041,6 +1066,8 @@ def _build_task_runner(
         return lambda: _coerce_tool_result_dict(refua_antibody_design(**kwargs))
     if tool_name == "refua_admet_profile" and _ADMET_AVAILABLE:
         return lambda: refua_admet_profile(**kwargs)
+    if tool_name == "refua_clinical_simulator" and _CLINICAL_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_clinical_simulator(**kwargs))
     return None
 
 
@@ -1418,7 +1445,11 @@ def _resolve_refua_protein_property_api() -> (
         available_properties_fn = available_protein_properties
 
     if available_groups_fn is None:
-        available_groups_fn = lambda: ()
+
+        def _empty_groups() -> tuple[str, ...]:
+            return ()
+
+        available_groups_fn = _empty_groups
 
     return (
         protein_properties_cls,
@@ -3347,6 +3378,95 @@ def refua_protein_properties(
     )
 
 
+def _normalize_workup_options(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("workup_options must be an object when provided.")
+    return dict(value)
+
+
+if _CLINICAL_AVAILABLE:
+
+    @mcp.tool()
+    def refua_clinical_simulator(
+        config: dict[str, Any] | None = None,
+        *,
+        trial_id: str | None = None,
+        indication: str | None = None,
+        phase: str | None = None,
+        objective: str | None = None,
+        seed: int | None = None,
+        replicates: int | None = None,
+        include_replicates: bool = False,
+        include_workup: bool = False,
+        workup_options: dict[str, Any] | None = None,
+        admet_profile: dict[str, Any] | None = None,
+        refua_payload: dict[str, Any] | None = None,
+        apply_refua_payload: bool = True,
+        refua_ligand_id: str | None = None,
+        refua_max_candidate_arms: int = 4,
+    ) -> dict[str, Any]:
+        """Run refua-clinical simulation with optional Refua payload integration."""
+
+        study_cls = _get_clinical_study_cls()
+        if config is None:
+            study = study_cls.default()
+        else:
+            if not isinstance(config, Mapping):
+                raise ValueError("config must be an object when provided.")
+            study = study_cls.from_config(dict(config))
+        study.trial(
+            trial_id=trial_id,
+            indication=indication,
+            phase=phase,
+            objective=objective,
+            seed=seed,
+            replicates=replicates,
+        )
+
+        if admet_profile is not None:
+            if not isinstance(admet_profile, Mapping):
+                raise ValueError("admet_profile must be an object when provided.")
+            study.admet_profile(dict(admet_profile), apply=True)
+
+        if refua_payload is not None:
+            if not isinstance(refua_payload, Mapping):
+                raise ValueError("refua_payload must be an object when provided.")
+            study.refua_payload(
+                dict(refua_payload),
+                apply=bool(apply_refua_payload),
+                ligand_id=refua_ligand_id,
+                max_candidate_arms=max(1, int(refua_max_candidate_arms)),
+            )
+
+        run = study.simulate(replicates=replicates, seed=seed)
+        run_payload = run.to_dict()
+        if not include_replicates:
+            run_payload.pop("replicates", None)
+
+        response: dict[str, Any] = {
+            "run_id": run.run_id,
+            "summary": dict(run.summary),
+            "run": run_payload,
+        }
+
+        if include_workup:
+            options = _normalize_workup_options(workup_options)
+            workup = run.workup(**options)
+            workup_payload: dict[str, Any] = {
+                "protocol": workup.protocol.to_dict(),
+                "optimization": workup.optimization.to_dict(),
+                "voi": workup.voi.to_dict(),
+                "advice": workup.advice.to_dict(),
+            }
+            if workup.transportability is not None:
+                workup_payload["transportability"] = workup.transportability
+            response["workup"] = workup_payload
+
+        return response
+
+
 def _capabilities_payload() -> dict[str, Any]:
     try:
         _resolve_refua_protein_property_api()
@@ -3360,6 +3480,7 @@ def _capabilities_payload() -> dict[str, Any]:
         "mcp_latest_protocol_version": str(LATEST_PROTOCOL_VERSION),
         "mcp_sdk_version": _MCP_SDK_VERSION,
         "refua_version": _REFUA_VERSION,
+        "refua_clinical_version": _REFUA_CLINICAL_VERSION,
         "runtime": {
             "transport": _RUNTIME_CONFIG.transport,
             "host": _RUNTIME_CONFIG.host,
@@ -3375,6 +3496,7 @@ def _capabilities_payload() -> dict[str, Any]:
         },
         "features": {
             "admet_available": _ADMET_AVAILABLE,
+            "clinical_simulator_available": _CLINICAL_AVAILABLE,
             "protein_properties_api_available": protein_property_api,
             "otel_available": _OTEL_AVAILABLE,
             "experimental_tasks_enabled": True,
@@ -3566,6 +3688,19 @@ _RECIPE_LIBRARY: dict[str, dict[str, Any]] = {
         },
     },
 }
+
+if _CLINICAL_AVAILABLE:
+    _RECIPE_LIBRARY["clinical_simulation"] = {
+        "tool": "refua_clinical_simulator",
+        "args": {
+            "trial_id": "small_molecule_phase2",
+            "indication": "Oncology",
+            "phase": "Phase II",
+            "replicates": 80,
+            "include_workup": True,
+            "include_replicates": False,
+        },
+    }
 
 
 @mcp.resource(
