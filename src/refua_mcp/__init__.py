@@ -1,6 +1,6 @@
 """Refua MCP server package."""
 
-from importlib.metadata import PackageNotFoundError, version as _version
+from importlib.metadata import version as _distribution_version
 from pathlib import Path
 import tomllib
 
@@ -19,15 +19,11 @@ def _read_version_from_pyproject() -> str | None:
     return str(version)
 
 
-_local_version = _read_version_from_pyproject()
+def _resolve_version() -> str:
+    local_version = _read_version_from_pyproject()
+    if local_version is not None:
+        return local_version
+    return _distribution_version("refua-mcp")
 
-try:
-    _installed_version = _version("refua-mcp")
-except PackageNotFoundError:
-    __version__ = _local_version or "unknown"
-else:
-    __version__ = (
-        _local_version
-        if _local_version is not None and _installed_version != _local_version
-        else _installed_version
-    )
+
+__version__ = _resolve_version()
