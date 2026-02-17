@@ -9,6 +9,14 @@ from mcp.types import CallToolResult
 import refua_mcp.server as server
 
 
+def test_clinical_tool_registration_matches_dependency() -> None:
+    tool_names = {info.name for info in server.mcp._tool_manager.list_tools()}
+    if server._CLINICAL_AVAILABLE:
+        assert "refua_clinical_simulator" in tool_names
+    else:
+        assert "refua_clinical_simulator" not in tool_names
+
+
 def test_refua_fold_schema_uses_discriminated_entities() -> None:
     tool = next(
         info

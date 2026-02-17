@@ -56,6 +56,10 @@ def test_sdk_acceptance_initialize_and_discovery() -> None:
             tool_names = {tool.name for tool in tools.tools}
             assert "refua_protein_properties" in tool_names
             assert "refua_fold" in tool_names
+            if server._CLINICAL_AVAILABLE:
+                assert "refua_clinical_simulator" in tool_names
+            else:
+                assert "refua_clinical_simulator" not in tool_names
 
             templates = await session.list_resource_templates()
             template_uris = {

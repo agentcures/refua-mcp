@@ -17,6 +17,10 @@ def test_capabilities_resource_reports_core_runtime_flags() -> None:
     assert "runtime" in payload
     assert payload["runtime"]["task_timeout_seconds"] >= 0
     assert payload["runtime"]["queue_timeout_seconds"] >= 0
+    assert (
+        payload["features"]["clinical_simulator_available"]
+        == server._CLINICAL_AVAILABLE
+    )
 
 
 def test_protein_property_resources_are_exposed() -> None:
@@ -24,6 +28,15 @@ def test_protein_property_resources_are_exposed() -> None:
     assert "property_names" in index
     assert "property_groups" in index
     assert index["count"]["properties"] == len(index["property_names"])
+
+
+def test_recipe_index_conditionally_includes_clinical_recipe() -> None:
+    payload = json.loads(server.refua_recipe_index())
+    names = set(payload["recipe_names"])
+    if server._CLINICAL_AVAILABLE:
+        assert "clinical_simulation" in names
+    else:
+        assert "clinical_simulation" not in names
 
 
 def test_recipe_completion_suggests_known_recipes() -> None:
