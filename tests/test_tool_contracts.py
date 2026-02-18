@@ -17,6 +17,20 @@ def test_clinical_tool_registration_matches_dependency() -> None:
         assert "refua_clinical_simulator" not in tool_names
 
 
+def test_data_tool_registration_matches_dependency() -> None:
+    tool_names = {info.name for info in server.mcp._tool_manager.list_tools()}
+    data_tools = {
+        "refua_data_list",
+        "refua_data_fetch",
+        "refua_data_materialize",
+        "refua_data_query",
+    }
+    if server._DATA_AVAILABLE:
+        assert data_tools.issubset(tool_names)
+    else:
+        assert data_tools.isdisjoint(tool_names)
+
+
 def test_refua_fold_schema_uses_discriminated_entities() -> None:
     tool = next(
         info

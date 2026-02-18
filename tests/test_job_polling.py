@@ -27,6 +27,8 @@ def test_task_support_mode_defaults() -> None:
     assert server._task_support_mode("refua_antibody_design") == "optional"
     expected = "optional" if server._CLINICAL_AVAILABLE else "forbidden"
     assert server._task_support_mode("refua_clinical_simulator") == expected
+    data_expected = "optional" if server._DATA_AVAILABLE else "forbidden"
+    assert server._task_support_mode("refua_data_query") == data_expected
     assert server._task_support_mode("unknown_tool") == "forbidden"
 
 

@@ -58,16 +58,18 @@ Use the typed Refua tools directly instead of speculative probing.
 Recommended sequence:
 1) Read capability/resource guidance (`refua://capabilities`,
    `refua://recipes/index`, and `refua://recipes/{recipe_name}`).
-2) For sequence-only analysis, use `refua_protein_properties`.
+2) For data-driven workflows, use `refua_data_list` to discover datasets and
+   `refua_data_materialize` / `refua_data_query` for local dataset access.
+3) For sequence-only analysis, use `refua_protein_properties`.
    Use `properties` for explicit property names, or `groups` for grouped summaries.
-3) Call `refua_validate_spec` to normalize/validate before expensive work.
+4) Call `refua_validate_spec` to normalize/validate before expensive work.
    Do not execute schema probes, sanity folds, or smoke-test designs.
-4) Execute with the focused tool:
+5) Execute with the focused tool:
    - `refua_fold` for structure/design folds
    - `refua_affinity` for affinity-only predictions
    - `refua_antibody_design` for antibody-heavy workflows
    - `refua_clinical_simulator` for clinical trial simulation (optional extra)
-5) For long runs, set `async_mode=true` and poll `refua_job` using
+6) For long runs, set `async_mode=true` and poll `refua_job` using
    `recommended_poll_seconds` or `wait_for_terminal_seconds`.
 """
 
@@ -278,6 +280,11 @@ try:  # noqa: SIM105
 except PackageNotFoundError:
     _REFUA_CLINICAL_VERSION = None
 
+try:  # noqa: SIM105
+    _REFUA_DATA_VERSION = package_version("refua-data")
+except PackageNotFoundError:
+    _REFUA_DATA_VERSION = None
+
 try:  # Optional observability dependency.
     from opentelemetry import metrics as otel_metrics  # type: ignore[reportMissingImports]
     from opentelemetry import trace as otel_trace  # type: ignore[reportMissingImports]
@@ -370,6 +377,16 @@ def _clinical_available() -> bool:
     return hasattr(ClinicalStudy, "simulate")
 
 
+def _data_available() -> bool:
+    if not _module_available("refua_data"):
+        return False
+    try:
+        from refua_data import DatasetManager  # type: ignore[import-not-found]
+    except Exception:
+        return False
+    return hasattr(DatasetManager, "materialize")
+
+
 def _get_clinical_study_cls() -> Any:
     from refua_clinical import ClinicalStudy  # type: ignore[import-not-found]
 
@@ -378,10 +395,109 @@ def _get_clinical_study_cls() -> Any:
 
 _ADMET_AVAILABLE = _admet_available()
 _CLINICAL_AVAILABLE = _clinical_available()
+_DATA_AVAILABLE = _data_available()
 _PROBE_RUN_NAME_RE = re.compile(
     r"(sanity|probe|schema|smoke|dry[_\-\s]?run)",
     re.IGNORECASE,
 )
+
+
+def _normalize_cache_root(cache_root: str | None) -> str | None:
+    if cache_root is None:
+        return None
+    text = str(cache_root).strip()
+    if not text:
+        return None
+    return str(Path(text).expanduser().resolve())
+
+
+@lru_cache(maxsize=8)
+def _get_refua_data_manager(cache_root: str | None) -> Any:
+    from refua_data import DataCache, DatasetManager  # type: ignore[import-not-found]
+
+    if cache_root is None:
+        return DatasetManager()
+    return DatasetManager(cache=DataCache(Path(cache_root)))
+
+
+def _normalize_string_column_list(value: Any, *, field_name: str) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field_name} must be an array of strings when provided.")
+    columns: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        text = str(raw).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        columns.append(text)
+    if not columns:
+        raise ValueError(f"{field_name} must contain at least one non-empty string.")
+    return columns
+
+
+def _normalize_data_query_filters(filters: Mapping[str, Any] | None) -> dict[str, Any]:
+    if filters is None:
+        return {}
+    if not isinstance(filters, Mapping):
+        raise ValueError("filters must be an object when provided.")
+    return {str(key): value for key, value in filters.items()}
+
+
+def _apply_data_query_filters(frame: Any, filters: Mapping[str, Any]) -> Any:
+    if not filters:
+        return frame
+
+    filtered = frame
+    for column, condition in filters.items():
+        if column not in filtered.columns:
+            raise ValueError(f"Unknown filter column '{column}'.")
+        series = filtered[column]
+
+        if isinstance(condition, Mapping):
+            for op, raw_value in condition.items():
+                op_name = str(op).strip().lower()
+                if op_name == "eq":
+                    filtered = filtered[series == raw_value]
+                elif op_name == "ne":
+                    filtered = filtered[series != raw_value]
+                elif op_name == "gt":
+                    filtered = filtered[series > raw_value]
+                elif op_name in {"gte", "ge"}:
+                    filtered = filtered[series >= raw_value]
+                elif op_name == "lt":
+                    filtered = filtered[series < raw_value]
+                elif op_name in {"lte", "le"}:
+                    filtered = filtered[series <= raw_value]
+                elif op_name == "in":
+                    if not isinstance(raw_value, (list, tuple, set)):
+                        raise ValueError(f"filters.{column}.in must be an array value.")
+                    filtered = filtered[series.isin(list(raw_value))]
+                elif op_name == "contains":
+                    pattern = str(raw_value)
+                    filtered = filtered[
+                        series.astype(str).str.contains(
+                            pattern,
+                            case=False,
+                            na=False,
+                            regex=False,
+                        )
+                    ]
+                else:
+                    raise ValueError(
+                        f"Unsupported filter operation '{op_name}' for column '{column}'."
+                    )
+                series = filtered[column]
+            continue
+
+        if isinstance(condition, (list, tuple, set)):
+            filtered = filtered[series.isin(list(condition))]
+        else:
+            filtered = filtered[series == condition]
+
+    return filtered
 
 
 @contextmanager
@@ -890,6 +1006,11 @@ _TASK_SUPPORT_BY_TOOL: dict[str, TaskExecutionMode] = {
 }
 if _CLINICAL_AVAILABLE:
     _TASK_SUPPORT_BY_TOOL["refua_clinical_simulator"] = "optional"
+if _DATA_AVAILABLE:
+    _TASK_SUPPORT_BY_TOOL["refua_data_list"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_data_fetch"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_data_materialize"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_data_query"] = "optional"
 
 
 def _clamp_seconds(value: float, minimum: int, maximum: int) -> int:
@@ -1068,6 +1189,14 @@ def _build_task_runner(
         return lambda: refua_admet_profile(**kwargs)
     if tool_name == "refua_clinical_simulator" and _CLINICAL_AVAILABLE:
         return lambda: _coerce_tool_result_dict(refua_clinical_simulator(**kwargs))
+    if tool_name == "refua_data_list" and _DATA_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_data_list(**kwargs))
+    if tool_name == "refua_data_fetch" and _DATA_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_data_fetch(**kwargs))
+    if tool_name == "refua_data_materialize" and _DATA_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_data_materialize(**kwargs))
+    if tool_name == "refua_data_query" and _DATA_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_data_query(**kwargs))
     return None
 
 
@@ -3467,6 +3596,251 @@ if _CLINICAL_AVAILABLE:
         return response
 
 
+if _DATA_AVAILABLE:
+
+    @mcp.tool()
+    def refua_data_list(
+        *,
+        tag: str | None = None,
+        limit: int = 200,
+        include_usage_notes: bool = True,
+        include_urls: bool = False,
+        cache_root: str | None = None,
+    ) -> dict[str, Any]:
+        """List datasets from refua-data catalog (optionally filtered by tag)."""
+        resolved_cache_root = _normalize_cache_root(cache_root)
+        manager = _get_refua_data_manager(resolved_cache_root)
+        tag_value = str(tag).strip() if tag is not None else None
+        if tag_value == "":
+            tag_value = None
+        if limit < 1:
+            raise ValueError("limit must be >= 1.")
+
+        datasets = manager.list_datasets(tag=tag_value)
+        selected = datasets[: int(limit)]
+        items: list[dict[str, Any]] = []
+        for dataset in selected:
+            snapshot = dict(dataset.metadata_snapshot())
+            if not include_usage_notes:
+                snapshot.pop("usage_notes", None)
+            if not include_urls:
+                snapshot.pop("urls", None)
+            items.append(snapshot)
+
+        return {
+            "tag": tag_value,
+            "count": len(items),
+            "total_available": len(datasets),
+            "datasets": items,
+            "cache_root": resolved_cache_root,
+        }
+
+    @mcp.tool()
+    def refua_data_fetch(
+        dataset_id: str,
+        *,
+        force: bool = False,
+        refresh: bool = False,
+        timeout_seconds: float = 120.0,
+        cache_root: str | None = None,
+        include_metadata: bool = False,
+    ) -> dict[str, Any]:
+        """Fetch a refua-data dataset into local cache."""
+        dataset_key = str(dataset_id or "").strip()
+        if not dataset_key:
+            raise ValueError("dataset_id is required.")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0.")
+
+        resolved_cache_root = _normalize_cache_root(cache_root)
+        manager = _get_refua_data_manager(resolved_cache_root)
+        result = manager.fetch(
+            dataset_key,
+            force=bool(force),
+            refresh=bool(refresh),
+            timeout_seconds=float(timeout_seconds),
+        )
+
+        payload: dict[str, Any] = {
+            "dataset_id": result.dataset_id,
+            "version": result.version,
+            "raw_path": str(result.raw_path),
+            "metadata_path": str(result.metadata_path),
+            "source_url": result.source_url,
+            "cache_hit": bool(result.cache_hit),
+            "refreshed": bool(result.refreshed),
+            "bytes_downloaded": int(result.bytes_downloaded),
+            "sha256": result.sha256,
+            "cache_root": resolved_cache_root,
+        }
+        if include_metadata:
+            meta = manager.cache.read_json(result.metadata_path)
+            payload["metadata"] = meta if isinstance(meta, dict) else {}
+        return payload
+
+    @mcp.tool()
+    def refua_data_materialize(
+        dataset_id: str,
+        *,
+        force: bool = False,
+        refresh: bool = False,
+        chunksize: int = 100_000,
+        timeout_seconds: float = 120.0,
+        cache_root: str | None = None,
+        include_manifest: bool = False,
+    ) -> dict[str, Any]:
+        """Fetch + materialize a refua-data dataset into chunked parquet."""
+        dataset_key = str(dataset_id or "").strip()
+        if not dataset_key:
+            raise ValueError("dataset_id is required.")
+        if chunksize < 1:
+            raise ValueError("chunksize must be >= 1.")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0.")
+
+        resolved_cache_root = _normalize_cache_root(cache_root)
+        manager = _get_refua_data_manager(resolved_cache_root)
+        result = manager.materialize(
+            dataset_key,
+            force=bool(force),
+            refresh=bool(refresh),
+            chunksize=int(chunksize),
+            timeout_seconds=float(timeout_seconds),
+        )
+
+        payload: dict[str, Any] = {
+            "dataset_id": result.dataset_id,
+            "version": result.version,
+            "parquet_dir": str(result.parquet_dir),
+            "manifest_path": str(result.manifest_path),
+            "parts": [str(path) for path in result.parts],
+            "part_count": len(result.parts),
+            "row_count": int(result.row_count),
+            "cache_hit": bool(result.cache_hit),
+            "source_sha256": result.source_sha256,
+            "cache_root": resolved_cache_root,
+        }
+        if include_manifest:
+            manifest = manager.cache.read_json(result.manifest_path)
+            payload["manifest"] = manifest if isinstance(manifest, dict) else {}
+        return payload
+
+    @mcp.tool()
+    def refua_data_query(
+        dataset_id: str,
+        *,
+        columns: list[str] | tuple[str, ...] | None = None,
+        filters: dict[str, Any] | None = None,
+        limit: int = 100,
+        cache_root: str | None = None,
+        materialize_if_missing: bool = True,
+        force_materialize: bool = False,
+        refresh: bool = False,
+        chunksize: int = 100_000,
+        timeout_seconds: float = 120.0,
+    ) -> dict[str, Any]:
+        """Query materialized parquet rows from a refua-data dataset."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1.")
+        if limit > 5000:
+            raise ValueError("limit must be <= 5000.")
+        if chunksize < 1:
+            raise ValueError("chunksize must be >= 1.")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0.")
+
+        dataset_key = str(dataset_id or "").strip()
+        if not dataset_key:
+            raise ValueError("dataset_id is required.")
+
+        query_columns = _normalize_string_column_list(columns, field_name="columns")
+        query_filters = _normalize_data_query_filters(filters)
+        resolved_cache_root = _normalize_cache_root(cache_root)
+        manager = _get_refua_data_manager(resolved_cache_root)
+
+        manifest: dict[str, Any] = {}
+        manifest_path_text: str | None = None
+        if materialize_if_missing:
+            materialized = manager.materialize(
+                dataset_key,
+                force=bool(force_materialize),
+                refresh=bool(refresh),
+                chunksize=int(chunksize),
+                timeout_seconds=float(timeout_seconds),
+            )
+            parts = list(materialized.parts)
+            manifest_path_text = str(materialized.manifest_path)
+            manifest_raw = manager.cache.read_json(materialized.manifest_path)
+            if isinstance(manifest_raw, dict):
+                manifest = dict(manifest_raw)
+            dataset_meta = manager.catalog.get(dataset_key).metadata_snapshot()
+        else:
+            dataset = manager.catalog.get(dataset_key)
+            dataset_meta = dataset.metadata_snapshot()
+            parquet_dir = manager.cache.parquet_dir(dataset)
+            manifest_path = manager.cache.parquet_manifest(dataset)
+            manifest_raw = manager.cache.read_json(manifest_path)
+            if not isinstance(manifest_raw, dict):
+                raise ValueError(
+                    f"Dataset '{dataset_key}' has no parquet manifest. Set materialize_if_missing=true."
+                )
+            manifest_path_text = str(manifest_path)
+            manifest = dict(manifest_raw)
+            parts_raw = manifest.get("parts")
+            if not isinstance(parts_raw, list) or not parts_raw:
+                raise ValueError(
+                    f"Dataset '{dataset_key}' parquet manifest has no parts."
+                )
+            parts = [parquet_dir.joinpath(str(name)) for name in parts_raw]
+            if not all(path.exists() for path in parts):
+                raise ValueError(
+                    f"Dataset '{dataset_key}' parquet parts are missing. Re-materialize with force_materialize=true."
+                )
+
+        import pandas as pd
+
+        rows: list[dict[str, Any]] = []
+        scanned_rows = 0
+        scanned_parts = 0
+        for part in parts:
+            frame = pd.read_parquet(part, columns=query_columns)
+            scanned_parts += 1
+            scanned_rows += int(len(frame))
+
+            filtered = _apply_data_query_filters(frame, query_filters)
+            if filtered.empty:
+                continue
+            if len(rows) >= limit:
+                break
+            remaining = int(limit) - len(rows)
+            batch = filtered.head(remaining)
+            rows.extend(batch.to_dict(orient="records"))
+            if len(rows) >= limit:
+                break
+
+        row_count_estimate = manifest.get("row_count")
+        row_count: int | None = None
+        if isinstance(row_count_estimate, (int, float, str)):
+            try:
+                row_count = int(row_count_estimate)
+            except (TypeError, ValueError):
+                row_count = None
+        return {
+            "dataset_id": dataset_key,
+            "columns": query_columns,
+            "filters": query_filters,
+            "limit": int(limit),
+            "returned_rows": len(rows),
+            "scanned_rows": scanned_rows,
+            "scanned_parts": scanned_parts,
+            "row_count_estimate": row_count,
+            "rows": rows,
+            "dataset": dataset_meta,
+            "cache_root": resolved_cache_root,
+            "manifest_path": manifest_path_text,
+        }
+
+
 def _capabilities_payload() -> dict[str, Any]:
     try:
         _resolve_refua_protein_property_api()
@@ -3481,6 +3855,7 @@ def _capabilities_payload() -> dict[str, Any]:
         "mcp_sdk_version": _MCP_SDK_VERSION,
         "refua_version": _REFUA_VERSION,
         "refua_clinical_version": _REFUA_CLINICAL_VERSION,
+        "refua_data_version": _REFUA_DATA_VERSION,
         "runtime": {
             "transport": _RUNTIME_CONFIG.transport,
             "host": _RUNTIME_CONFIG.host,
@@ -3497,6 +3872,7 @@ def _capabilities_payload() -> dict[str, Any]:
         "features": {
             "admet_available": _ADMET_AVAILABLE,
             "clinical_simulator_available": _CLINICAL_AVAILABLE,
+            "data_available": _DATA_AVAILABLE,
             "protein_properties_api_available": protein_property_api,
             "otel_available": _OTEL_AVAILABLE,
             "experimental_tasks_enabled": True,
@@ -3688,6 +4064,25 @@ _RECIPE_LIBRARY: dict[str, dict[str, Any]] = {
         },
     },
 }
+
+if _DATA_AVAILABLE:
+    _RECIPE_LIBRARY["data_materialize"] = {
+        "tool": "refua_data_materialize",
+        "args": {
+            "dataset_id": "chembl_activity_ki_human",
+            "chunksize": 100000,
+            "refresh": False,
+        },
+    }
+    _RECIPE_LIBRARY["data_query"] = {
+        "tool": "refua_data_query",
+        "args": {
+            "dataset_id": "chembl_activity_ki_human",
+            "columns": ["molecule_chembl_id", "standard_value", "standard_units"],
+            "filters": {"standard_units": "nM"},
+            "limit": 25,
+        },
+    }
 
 if _CLINICAL_AVAILABLE:
     _RECIPE_LIBRARY["clinical_simulation"] = {
