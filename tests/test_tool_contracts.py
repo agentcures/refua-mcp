@@ -31,6 +31,21 @@ def test_data_tool_registration_matches_dependency() -> None:
         assert data_tools.isdisjoint(tool_names)
 
 
+def test_preclinical_tool_registration_matches_dependency() -> None:
+    tool_names = {info.name for info in server.mcp._tool_manager.list_tools()}
+    preclinical_tools = {
+        "refua_preclinical_templates",
+        "refua_preclinical_plan",
+        "refua_preclinical_schedule",
+        "refua_preclinical_bioanalysis",
+        "refua_preclinical_workup",
+    }
+    if server._PRECLINICAL_AVAILABLE:
+        assert preclinical_tools.issubset(tool_names)
+    else:
+        assert preclinical_tools.isdisjoint(tool_names)
+
+
 def test_refua_fold_schema_uses_discriminated_entities() -> None:
     tool = next(
         info

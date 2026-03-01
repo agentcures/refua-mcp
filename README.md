@@ -23,6 +23,12 @@ Clinical trial simulation is optional; install the clinical extra:
 pip install "refua-mcp[clinical]"
 ```
 
+Preclinical planning/scheduling/bioanalysis tools are optional; install the preclinical extra:
+
+```bash
+pip install "refua-mcp[preclinical]"
+```
+
 OpenTelemetry spans/metrics are optional:
 
 ```bash
@@ -108,6 +114,11 @@ Security/runtime controls:
 - `refua_job`: check status/results for background jobs.
 - `refua_admet_profile` (optional): run model-based ADMET predictions for SMILES strings (requires `refua[admet]`).
 - `refua_clinical_simulator` (optional): run the `refua-clinical` simulator and optional workup (requires `refua-mcp[clinical]`).
+- `refua_preclinical_templates` (optional): fetch default study + sample templates and curated references (requires `refua-mcp[preclinical]`).
+- `refua_preclinical_plan` (optional): generate GLP tox/pharmacology study planning payloads.
+- `refua_preclinical_schedule` (optional): generate in vivo operational schedules.
+- `refua_preclinical_bioanalysis` (optional): run bioanalytical ETL/QC and simple NCA summaries.
+- `refua_preclinical_workup` (optional): generate integrated preclinical workups with optional bioanalysis.
 
 All major tools expose strict JSON schemas, including discriminated entity unions by `type` and typed output schemas.
 
@@ -148,6 +159,8 @@ Recipe names:
 - `antibody_design`
 - `protein_properties`
 - `clinical_simulation` (optional; available when `refua-clinical` is installed)
+- `preclinical_plan` (optional; available when `refua-preclinical` is installed)
+- `preclinical_workup` (optional; available when `refua-preclinical` is installed)
 
 ## Workflow
 
@@ -157,7 +170,7 @@ Recommended call sequence:
 2. Read `refua://capabilities` for runtime support and limits.
 3. For sequence-only property analysis, call `refua_protein_properties`.
 4. Call `refua_validate_spec` to catch schema/logic issues before expensive runs (`deep_validate=true` for asset-backed construction checks).
-5. Execute `refua_fold`, `refua_affinity`, `refua_antibody_design`, or `refua_clinical_simulator` (optional).
+5. Execute `refua_fold`, `refua_affinity`, `refua_antibody_design`, `refua_clinical_simulator` (optional), or the `refua_preclinical_*` tools (optional).
 6. For long runs, set `async_mode=true` and poll `refua_job`.
 
 ## Examples
@@ -272,6 +285,20 @@ Clinical simulation (optional):
 }
 ```
 
+Preclinical workup (optional):
+
+```json
+{
+  "tool": "refua_preclinical_workup",
+  "args": {
+    "seed": 7,
+    "lloq_ng_ml": 1.0,
+    "use_template_rows_when_missing": true,
+    "include_references": true
+  }
+}
+```
+
 Note: DNA/RNA entities are supported for Boltz2 folding only (BoltzGen does not accept DNA/RNA entities).
 
 ## Long-Running Jobs
@@ -325,7 +352,10 @@ Long-poll support:
 This server enables MCP experimental task support (`tasks/get`, `tasks/result`,
 `tasks/list`, `tasks/cancel`) and advertises task execution support for
 `refua_validate_spec`, `refua_fold`, `refua_affinity`, `refua_antibody_design`,
-and `refua_admet_profile`. `refua_clinical_simulator` is also task-enabled when installed.
+and `refua_admet_profile`. `refua_clinical_simulator` and
+`refua_preclinical_templates` / `refua_preclinical_plan` /
+`refua_preclinical_schedule` / `refua_preclinical_bioanalysis` /
+`refua_preclinical_workup` are also task-enabled when installed.
 
 If your client supports task-augmented tool calls, prefer tasks for long-running
 operations. Task cancellation (`tasks/cancel`) is wired to background job cancellation.

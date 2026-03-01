@@ -53,6 +53,9 @@ observability = [
 clinical = [
   "refua-clinical>=0.2.0",
 ]
+preclinical = [
+  "refua-preclinical>=0.1.0",
+]
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = ">=4.1"

@@ -60,6 +60,9 @@ Recommended sequence:
    `refua://recipes/index`, and `refua://recipes/{recipe_name}`).
 2) For data-driven workflows, use `refua_data_list` to discover datasets and
    `refua_data_materialize` / `refua_data_query` for local dataset access.
+   For preclinical workflows, use `refua_preclinical_templates` to bootstrap
+   specs, then `refua_preclinical_plan` / `refua_preclinical_schedule` /
+   `refua_preclinical_bioanalysis` / `refua_preclinical_workup`.
 3) For sequence-only analysis, use `refua_protein_properties`.
    Use `properties` for explicit property names, or `groups` for grouped summaries.
 4) Call `refua_validate_spec` to normalize/validate before expensive work.
@@ -285,6 +288,11 @@ try:  # noqa: SIM105
 except PackageNotFoundError:
     _REFUA_DATA_VERSION = None
 
+try:  # noqa: SIM105
+    _REFUA_PRECLINICAL_VERSION = package_version("refua-preclinical")
+except PackageNotFoundError:
+    _REFUA_PRECLINICAL_VERSION = None
+
 try:  # Optional observability dependency.
     from opentelemetry import metrics as otel_metrics  # type: ignore[reportMissingImports]
     from opentelemetry import trace as otel_trace  # type: ignore[reportMissingImports]
@@ -387,15 +395,42 @@ def _data_available() -> bool:
     return hasattr(DatasetManager, "materialize")
 
 
+def _preclinical_available() -> bool:
+    if not _module_available("refua_preclinical"):
+        return False
+    try:
+        import refua_preclinical as preclinical  # type: ignore[import-not-found]
+    except Exception:
+        return False
+    required_exports = (
+        "default_study_spec",
+        "study_spec_from_mapping",
+        "build_study_plan",
+        "build_in_vivo_schedule",
+        "run_bioanalytical_pipeline",
+        "build_workup",
+        "default_templates",
+        "latest_preclinical_references",
+    )
+    return all(hasattr(preclinical, name) for name in required_exports)
+
+
 def _get_clinical_study_cls() -> Any:
     from refua_clinical import ClinicalStudy  # type: ignore[import-not-found]
 
     return ClinicalStudy
 
 
+def _get_preclinical_module() -> Any:
+    import refua_preclinical  # type: ignore[import-not-found]
+
+    return refua_preclinical
+
+
 _ADMET_AVAILABLE = _admet_available()
 _CLINICAL_AVAILABLE = _clinical_available()
 _DATA_AVAILABLE = _data_available()
+_PRECLINICAL_AVAILABLE = _preclinical_available()
 _PROBE_RUN_NAME_RE = re.compile(
     r"(sanity|probe|schema|smoke|dry[_\-\s]?run)",
     re.IGNORECASE,
@@ -1011,6 +1046,12 @@ if _DATA_AVAILABLE:
     _TASK_SUPPORT_BY_TOOL["refua_data_fetch"] = "optional"
     _TASK_SUPPORT_BY_TOOL["refua_data_materialize"] = "optional"
     _TASK_SUPPORT_BY_TOOL["refua_data_query"] = "optional"
+if _PRECLINICAL_AVAILABLE:
+    _TASK_SUPPORT_BY_TOOL["refua_preclinical_templates"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_preclinical_plan"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_preclinical_schedule"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_preclinical_bioanalysis"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_preclinical_workup"] = "optional"
 
 
 def _clamp_seconds(value: float, minimum: int, maximum: int) -> int:
@@ -1197,6 +1238,16 @@ def _build_task_runner(
         return lambda: _coerce_tool_result_dict(refua_data_materialize(**kwargs))
     if tool_name == "refua_data_query" and _DATA_AVAILABLE:
         return lambda: _coerce_tool_result_dict(refua_data_query(**kwargs))
+    if tool_name == "refua_preclinical_templates" and _PRECLINICAL_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_preclinical_templates(**kwargs))
+    if tool_name == "refua_preclinical_plan" and _PRECLINICAL_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_preclinical_plan(**kwargs))
+    if tool_name == "refua_preclinical_schedule" and _PRECLINICAL_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_preclinical_schedule(**kwargs))
+    if tool_name == "refua_preclinical_bioanalysis" and _PRECLINICAL_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_preclinical_bioanalysis(**kwargs))
+    if tool_name == "refua_preclinical_workup" and _PRECLINICAL_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_preclinical_workup(**kwargs))
     return None
 
 
@@ -3515,6 +3566,169 @@ def _normalize_workup_options(value: Mapping[str, Any] | None) -> dict[str, Any]
     return dict(value)
 
 
+def _normalize_preclinical_study(
+    study: Mapping[str, Any] | None,
+) -> Any:
+    preclinical = _get_preclinical_module()
+    if study is None:
+        return preclinical.default_study_spec()
+    if not isinstance(study, Mapping):
+        raise ValueError("study must be an object when provided.")
+    return preclinical.study_spec_from_mapping(dict(study))
+
+
+def _normalize_preclinical_rows(
+    rows: list[dict[str, Any]] | None,
+    *,
+    field_name: str,
+    use_template_rows_when_missing: bool,
+) -> list[dict[str, Any]] | None:
+    preclinical = _get_preclinical_module()
+    raw_rows: Any = rows
+    if raw_rows is None and use_template_rows_when_missing:
+        templates = preclinical.default_templates()
+        raw_rows = templates.get("bioanalysis_rows")
+
+    if raw_rows is None:
+        return None
+    if not isinstance(raw_rows, list):
+        raise ValueError(f"{field_name} must be an array of objects when provided.")
+
+    normalized: list[dict[str, Any]] = []
+    for idx, row in enumerate(raw_rows):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"{field_name}[{idx}] must be an object.")
+        normalized.append(dict(row))
+    return normalized
+
+
+if _PRECLINICAL_AVAILABLE:
+
+    @mcp.tool()
+    def refua_preclinical_templates(
+        *,
+        include_references: bool = True,
+    ) -> dict[str, Any]:
+        """Return default study/sample templates for refua-preclinical workflows."""
+        preclinical = _get_preclinical_module()
+        payload: dict[str, Any] = {
+            "templates": preclinical.default_templates(),
+        }
+        if include_references:
+            payload["references"] = preclinical.latest_preclinical_references()
+        if _REFUA_PRECLINICAL_VERSION is not None:
+            payload["refua_preclinical_version"] = _REFUA_PRECLINICAL_VERSION
+        return payload
+
+    @mcp.tool()
+    def refua_preclinical_plan(
+        study: dict[str, Any] | None = None,
+        *,
+        seed: int = 7,
+        include_markdown: bool = False,
+        include_references: bool = False,
+    ) -> dict[str, Any]:
+        """Build GLP/tox/pharmacology study plan outputs from a study spec."""
+        preclinical = _get_preclinical_module()
+        spec = _normalize_preclinical_study(study)
+        plan = preclinical.build_study_plan(spec, seed=int(seed))
+        payload: dict[str, Any] = {
+            "study_id": str(getattr(spec, "study_id", plan.get("study_id", ""))),
+            "plan": plan,
+        }
+        if include_markdown:
+            payload["plan_markdown"] = preclinical.render_plan_markdown(plan)
+        if include_references:
+            payload["references"] = preclinical.latest_preclinical_references()
+        return payload
+
+    @mcp.tool()
+    def refua_preclinical_schedule(
+        study: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Generate in vivo dosing/sampling/observation schedule from a study spec."""
+        preclinical = _get_preclinical_module()
+        spec = _normalize_preclinical_study(study)
+        schedule = preclinical.build_in_vivo_schedule(spec)
+        return {
+            "study_id": str(getattr(spec, "study_id", schedule.get("study_id", ""))),
+            "schedule": schedule,
+        }
+
+    @mcp.tool()
+    def refua_preclinical_bioanalysis(
+        study: dict[str, Any] | None = None,
+        *,
+        rows: list[dict[str, Any]] | None = None,
+        lloq_ng_ml: float = 1.0,
+        use_template_rows_when_missing: bool = True,
+    ) -> dict[str, Any]:
+        """Run bioanalytical ETL/QC summary + simple NCA outputs."""
+        if lloq_ng_ml <= 0:
+            raise ValueError("lloq_ng_ml must be > 0.")
+        preclinical = _get_preclinical_module()
+        spec = _normalize_preclinical_study(study)
+        normalized_rows = _normalize_preclinical_rows(
+            rows,
+            field_name="rows",
+            use_template_rows_when_missing=bool(use_template_rows_when_missing),
+        )
+        if normalized_rows is None:
+            raise ValueError(
+                "rows are required when use_template_rows_when_missing=false."
+            )
+        bioanalysis = preclinical.run_bioanalytical_pipeline(
+            spec,
+            normalized_rows,
+            lloq_ng_ml=float(lloq_ng_ml),
+        )
+        return {
+            "study_id": str(getattr(spec, "study_id", bioanalysis.get("study_id", ""))),
+            "bioanalysis": bioanalysis,
+        }
+
+    @mcp.tool()
+    def refua_preclinical_workup(
+        study: dict[str, Any] | None = None,
+        *,
+        samples: list[dict[str, Any]] | None = None,
+        seed: int = 7,
+        lloq_ng_ml: float = 1.0,
+        include_markdown: bool = False,
+        include_references: bool = False,
+        use_template_rows_when_missing: bool = False,
+    ) -> dict[str, Any]:
+        """Build an integrated preclinical package with plan/schedule and optional bioanalysis."""
+        if lloq_ng_ml <= 0:
+            raise ValueError("lloq_ng_ml must be > 0.")
+        preclinical = _get_preclinical_module()
+        spec = _normalize_preclinical_study(study)
+        normalized_samples = _normalize_preclinical_rows(
+            samples,
+            field_name="samples",
+            use_template_rows_when_missing=bool(use_template_rows_when_missing),
+        )
+        workup = preclinical.build_workup(
+            spec,
+            samples=normalized_samples,
+            seed=int(seed),
+            lloq_ng_ml=float(lloq_ng_ml),
+        )
+        payload: dict[str, Any] = {
+            "study_id": str(getattr(spec, "study_id", workup.get("study_id", ""))),
+            "workup": workup,
+        }
+        if include_markdown:
+            plan_payload = workup.get("plan")
+            if isinstance(plan_payload, Mapping):
+                payload["plan_markdown"] = preclinical.render_plan_markdown(
+                    dict(plan_payload)
+                )
+        if include_references:
+            payload["references"] = preclinical.latest_preclinical_references()
+        return payload
+
+
 if _CLINICAL_AVAILABLE:
 
     @mcp.tool()
@@ -3856,6 +4070,7 @@ def _capabilities_payload() -> dict[str, Any]:
         "refua_version": _REFUA_VERSION,
         "refua_clinical_version": _REFUA_CLINICAL_VERSION,
         "refua_data_version": _REFUA_DATA_VERSION,
+        "refua_preclinical_version": _REFUA_PRECLINICAL_VERSION,
         "runtime": {
             "transport": _RUNTIME_CONFIG.transport,
             "host": _RUNTIME_CONFIG.host,
@@ -3873,6 +4088,7 @@ def _capabilities_payload() -> dict[str, Any]:
             "admet_available": _ADMET_AVAILABLE,
             "clinical_simulator_available": _CLINICAL_AVAILABLE,
             "data_available": _DATA_AVAILABLE,
+            "preclinical_available": _PRECLINICAL_AVAILABLE,
             "protein_properties_api_available": protein_property_api,
             "otel_available": _OTEL_AVAILABLE,
             "experimental_tasks_enabled": True,
@@ -4094,6 +4310,25 @@ if _CLINICAL_AVAILABLE:
             "replicates": 80,
             "include_workup": True,
             "include_replicates": False,
+        },
+    }
+
+if _PRECLINICAL_AVAILABLE:
+    _RECIPE_LIBRARY["preclinical_plan"] = {
+        "tool": "refua_preclinical_plan",
+        "args": {
+            "seed": 7,
+            "include_markdown": True,
+            "include_references": True,
+        },
+    }
+    _RECIPE_LIBRARY["preclinical_workup"] = {
+        "tool": "refua_preclinical_workup",
+        "args": {
+            "seed": 7,
+            "lloq_ng_ml": 1.0,
+            "use_template_rows_when_missing": True,
+            "include_references": True,
         },
     }
 

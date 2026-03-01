@@ -22,6 +22,7 @@ def test_capabilities_resource_reports_core_runtime_flags() -> None:
         == server._CLINICAL_AVAILABLE
     )
     assert payload["features"]["data_available"] == server._DATA_AVAILABLE
+    assert payload["features"]["preclinical_available"] == server._PRECLINICAL_AVAILABLE
 
 
 def test_protein_property_resources_are_exposed() -> None:
@@ -44,6 +45,12 @@ def test_recipe_index_conditionally_includes_clinical_recipe() -> None:
     else:
         assert "data_materialize" not in names
         assert "data_query" not in names
+    if server._PRECLINICAL_AVAILABLE:
+        assert "preclinical_plan" in names
+        assert "preclinical_workup" in names
+    else:
+        assert "preclinical_plan" not in names
+        assert "preclinical_workup" not in names
 
 
 def test_recipe_completion_suggests_known_recipes() -> None:
