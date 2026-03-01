@@ -25,6 +25,8 @@ def test_task_support_mode_defaults() -> None:
     assert server._task_support_mode("refua_fold") == "optional"
     assert server._task_support_mode("refua_affinity") == "optional"
     assert server._task_support_mode("refua_antibody_design") == "optional"
+    assert server._task_support_mode("refua_protein_properties") == "optional"
+    assert server._task_support_mode("refua_job") == "optional"
     expected = "optional" if server._CLINICAL_AVAILABLE else "forbidden"
     assert server._task_support_mode("refua_clinical_simulator") == expected
     data_expected = "optional" if server._DATA_AVAILABLE else "forbidden"
@@ -200,3 +202,38 @@ def test_queue_timeout_fails_stale_job() -> None:
     second_snapshot = _wait_for_terminal(second)
     assert second_snapshot["status"] == "error"
     assert second_snapshot["error"]["code"] == "queue_timeout"
+
+
+def test_build_task_runner_supports_protein_properties(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_tool(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(server, "refua_protein_properties", fake_tool)
+    runner = server._build_task_runner(
+        "refua_protein_properties",
+        {"sequence": "MKTAYIAK"},
+    )
+    assert runner is not None
+    assert runner() == {"ok": True}
+    assert captured["sequence"] == "MKTAYIAK"
+
+
+def test_build_task_runner_supports_refua_job(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_tool(**kwargs):
+        captured.update(kwargs)
+        return {"status": "running"}
+
+    monkeypatch.setattr(server, "refua_job", fake_tool)
+    runner = server._build_task_runner(
+        "refua_job",
+        {"job_id": "job-123", "include_result": True},
+    )
+    assert runner is not None
+    assert runner() == {"status": "running"}
+    assert captured["job_id"] == "job-123"
+    assert captured["include_result"] is True

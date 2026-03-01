@@ -1048,6 +1048,8 @@ _TASK_SUPPORT_BY_TOOL: dict[str, TaskExecutionMode] = {
     "refua_fold": "optional",
     "refua_affinity": "optional",
     "refua_antibody_design": "optional",
+    "refua_protein_properties": "optional",
+    "refua_job": "optional",
     "refua_admet_profile": "optional",
 }
 if _CLINICAL_AVAILABLE:
@@ -1243,6 +1245,10 @@ def _build_task_runner(
         if tool_name == "refua_affinity":
             return lambda: _coerce_tool_result_dict(refua_affinity(**kwargs))
         return lambda: _coerce_tool_result_dict(refua_antibody_design(**kwargs))
+    if tool_name == "refua_protein_properties":
+        return lambda: _coerce_tool_result_dict(refua_protein_properties(**kwargs))
+    if tool_name == "refua_job":
+        return lambda: _coerce_tool_result_dict(refua_job(**kwargs))
     if tool_name == "refua_admet_profile" and _ADMET_AVAILABLE:
         return lambda: refua_admet_profile(**kwargs)
     if tool_name == "refua_clinical_simulator" and _CLINICAL_AVAILABLE:

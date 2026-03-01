@@ -111,6 +111,10 @@ Security/runtime controls:
 - `refua_affinity`: run affinity-only predictions.
 - `refua_antibody_design`: focused antibody entrypoint (`antibody` + optional `context_entities`).
 - `refua_protein_properties`: compute sequence-based protein properties via Refua's `ProteinProperties` API.
+- `refua_data_list` (optional): list datasets from `refua-data` catalog.
+- `refua_data_fetch` (optional): fetch one dataset into local cache.
+- `refua_data_materialize` (optional): materialize one dataset into parquet parts.
+- `refua_data_query` (optional): query filtered rows from materialized parquet data.
 - `refua_job`: check status/results for background jobs.
 - `refua_admet_profile` (optional): run model-based ADMET predictions for SMILES strings (requires `refua[admet]`).
 - `refua_clinical_simulator` (optional): run the `refua-clinical` simulator and optional workup (requires `refua-mcp[clinical]`).
