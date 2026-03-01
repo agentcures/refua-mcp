@@ -48,9 +48,13 @@ def test_recipe_index_conditionally_includes_clinical_recipe() -> None:
     if server._PRECLINICAL_AVAILABLE:
         assert "preclinical_plan" in names
         assert "preclinical_workup" in names
+        assert "preclinical_cmc_plan" in names
+        assert "preclinical_cmc_release" in names
     else:
         assert "preclinical_plan" not in names
         assert "preclinical_workup" not in names
+        assert "preclinical_cmc_plan" not in names
+        assert "preclinical_cmc_release" not in names
 
 
 def test_recipe_completion_suggests_known_recipes() -> None:

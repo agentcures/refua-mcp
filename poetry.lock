@@ -3790,6 +3790,46 @@ test = ["pandas (>=2.2.2)", "pytest", "requests"]
 train = ["matplotlib", "pandas (>=2.2.2)", "wandb (>=0.18.7)"]
 
 [[package]]
+name = "refua-clinical"
+version = "0.6.0"
+description = "PK/PD-driven virtual patient and clinical trial simulation toolkit for Refua."
+optional = true
+python-versions = "<3.15,>=3.11"
+groups = ["main"]
+markers = "extra == \"clinical\""
+files = [
+    {file = "refua_clinical-0.6.0-py3-none-any.whl", hash = "sha256:ad1775bec26ffc694158db532eb52c262bf9d4e8da96ef9cf41e5b373dac1c4e"},
+    {file = "refua_clinical-0.6.0.tar.gz", hash = "sha256:36b5069911bba8cf2af43ed54daf0c62b0d91bf9ddaf2275d8fb9231e89b4762"},
+]
+
+[package.dependencies]
+numpy = ">=1.26.0"
+pandas = ">=2.2.2"
+pyyaml = ">=6.0.1"
+scipy = ">=1.13.0"
+
+[package.extras]
+admet = ["refua (>=0.6.0)"]
+dev = ["build (>=1.2.2)", "mypy (>=1.11.0)", "pandas-stubs (>=2.2.3.250527)", "pytest (>=8.0.0)", "ruff (>=0.6.0)", "twine (>=6.1.0)", "types-PyYAML (>=6.0.12.20250915)"]
+integrations = ["refua-data (>=0.6.0)", "refua-regulatory (>=0.6.0)"]
+
+[[package]]
+name = "refua-preclinical"
+version = "0.6.0"
+description = "GLP tox/pharmacology planning, in vivo scheduling, and bioanalytical pipelines for Refua."
+optional = true
+python-versions = "<3.15,>=3.11"
+groups = ["main"]
+markers = "extra == \"preclinical\""
+files = [
+    {file = "refua_preclinical-0.6.0-py3-none-any.whl", hash = "sha256:53a9f6b343de20161f501d0bd556b3c40bc00f82142a9f7e8b0af6423772ebd5"},
+    {file = "refua_preclinical-0.6.0.tar.gz", hash = "sha256:d1a7bf6414dd6ee0ea651fca6161dcf13467e6f15b34ad65c00f7427bf3591b8"},
+]
+
+[package.extras]
+test = ["pytest (>=7.0)"]
+
+[[package]]
 name = "requests"
 version = "2.32.5"
 description = "Python HTTP for Humans."
@@ -4750,11 +4790,13 @@ test = ["big-O", "jaraco.functools", "jaraco.itertools", "jaraco.test", "more_it
 type = ["pytest-mypy"]
 
 [extras]
+clinical = ["refua-clinical"]
 dev = ["pre-commit"]
 observability = ["opentelemetry-api"]
+preclinical = ["refua-preclinical"]
 test = ["pytest"]
 
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.14"
-content-hash = "746153d6ae16e6c71b11931e80df0dda5962649b0235455c0324d81c1150b0a0"
+content-hash = "86a65723136810d194a45a90a579047e4eca89698329c52a7c87de5ade202a08"

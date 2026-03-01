@@ -23,7 +23,7 @@ Clinical trial simulation is optional; install the clinical extra:
 pip install "refua-mcp[clinical]"
 ```
 
-Preclinical planning/scheduling/bioanalysis tools are optional; install the preclinical extra:
+Preclinical planning/scheduling/bioanalysis/CMC tools are optional; install the preclinical extra:
 
 ```bash
 pip install "refua-mcp[preclinical]"
@@ -119,6 +119,12 @@ Security/runtime controls:
 - `refua_preclinical_schedule` (optional): generate in vivo operational schedules.
 - `refua_preclinical_bioanalysis` (optional): run bioanalytical ETL/QC and simple NCA summaries.
 - `refua_preclinical_workup` (optional): generate integrated preclinical workups with optional bioanalysis.
+- `refua_preclinical_cmc_templates` (optional): fetch CMC starter templates and references.
+- `refua_preclinical_cmc_plan` (optional): generate formulation/process/QbD/validation CMC planning outputs.
+- `refua_preclinical_batch_record` (optional): generate electronic batch record templates.
+- `refua_preclinical_stability_plan` (optional): generate stability study schedules.
+- `refua_preclinical_stability_assess` (optional): assess stability results against criteria.
+- `refua_preclinical_release_assess` (optional): evaluate release decisions from batch/stability evidence.
 
 All major tools expose strict JSON schemas, including discriminated entity unions by `type` and typed output schemas.
 
@@ -161,6 +167,8 @@ Recipe names:
 - `clinical_simulation` (optional; available when `refua-clinical` is installed)
 - `preclinical_plan` (optional; available when `refua-preclinical` is installed)
 - `preclinical_workup` (optional; available when `refua-preclinical` is installed)
+- `preclinical_cmc_plan` (optional; available when `refua-preclinical` is installed)
+- `preclinical_cmc_release` (optional; available when `refua-preclinical` is installed)
 
 ## Workflow
 
@@ -299,6 +307,25 @@ Preclinical workup (optional):
 }
 ```
 
+Preclinical CMC release assessment (optional):
+
+```json
+{
+  "tool": "refua_preclinical_release_assess",
+  "args": {
+    "batch_results": {
+      "assay_percent": 99.0,
+      "content_uniformity_av": 9.8,
+      "dissolution_q30_percent": 92.0,
+      "total_impurities_percent": 0.7,
+      "water_content_percent": 1.5,
+      "appearance_score": 5.0
+    },
+    "include_references": true
+  }
+}
+```
+
 Note: DNA/RNA entities are supported for Boltz2 folding only (BoltzGen does not accept DNA/RNA entities).
 
 ## Long-Running Jobs
@@ -355,7 +382,10 @@ This server enables MCP experimental task support (`tasks/get`, `tasks/result`,
 and `refua_admet_profile`. `refua_clinical_simulator` and
 `refua_preclinical_templates` / `refua_preclinical_plan` /
 `refua_preclinical_schedule` / `refua_preclinical_bioanalysis` /
-`refua_preclinical_workup` are also task-enabled when installed.
+`refua_preclinical_workup` / `refua_preclinical_cmc_templates` /
+`refua_preclinical_cmc_plan` / `refua_preclinical_batch_record` /
+`refua_preclinical_stability_plan` / `refua_preclinical_stability_assess` /
+`refua_preclinical_release_assess` are also task-enabled when installed.
 
 If your client supports task-augmented tool calls, prefer tasks for long-running
 operations. Task cancellation (`tasks/cancel`) is wired to background job cancellation.

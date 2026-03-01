@@ -63,6 +63,10 @@ Recommended sequence:
    For preclinical workflows, use `refua_preclinical_templates` to bootstrap
    specs, then `refua_preclinical_plan` / `refua_preclinical_schedule` /
    `refua_preclinical_bioanalysis` / `refua_preclinical_workup`.
+   For CMC operations, use `refua_preclinical_cmc_templates`,
+   `refua_preclinical_cmc_plan`, `refua_preclinical_batch_record`,
+   `refua_preclinical_stability_plan`, `refua_preclinical_stability_assess`,
+   and `refua_preclinical_release_assess`.
 3) For sequence-only analysis, use `refua_protein_properties`.
    Use `properties` for explicit property names, or `groups` for grouped summaries.
 4) Call `refua_validate_spec` to normalize/validate before expensive work.
@@ -411,6 +415,13 @@ def _preclinical_available() -> bool:
         "build_workup",
         "default_templates",
         "latest_preclinical_references",
+        "default_cmc_templates",
+        "build_formulation_process_plan",
+        "generate_batch_record",
+        "build_stability_study_plan",
+        "assess_stability_results",
+        "evaluate_release_criteria",
+        "latest_cmc_references",
     )
     return all(hasattr(preclinical, name) for name in required_exports)
 
@@ -1052,6 +1063,12 @@ if _PRECLINICAL_AVAILABLE:
     _TASK_SUPPORT_BY_TOOL["refua_preclinical_schedule"] = "optional"
     _TASK_SUPPORT_BY_TOOL["refua_preclinical_bioanalysis"] = "optional"
     _TASK_SUPPORT_BY_TOOL["refua_preclinical_workup"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_preclinical_cmc_templates"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_preclinical_cmc_plan"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_preclinical_batch_record"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_preclinical_stability_plan"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_preclinical_stability_assess"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_preclinical_release_assess"] = "optional"
 
 
 def _clamp_seconds(value: float, minimum: int, maximum: int) -> int:
@@ -1248,6 +1265,28 @@ def _build_task_runner(
         return lambda: _coerce_tool_result_dict(refua_preclinical_bioanalysis(**kwargs))
     if tool_name == "refua_preclinical_workup" and _PRECLINICAL_AVAILABLE:
         return lambda: _coerce_tool_result_dict(refua_preclinical_workup(**kwargs))
+    if tool_name == "refua_preclinical_cmc_templates" and _PRECLINICAL_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(
+            refua_preclinical_cmc_templates(**kwargs)
+        )
+    if tool_name == "refua_preclinical_cmc_plan" and _PRECLINICAL_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_preclinical_cmc_plan(**kwargs))
+    if tool_name == "refua_preclinical_batch_record" and _PRECLINICAL_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(
+            refua_preclinical_batch_record(**kwargs)
+        )
+    if tool_name == "refua_preclinical_stability_plan" and _PRECLINICAL_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(
+            refua_preclinical_stability_plan(**kwargs)
+        )
+    if tool_name == "refua_preclinical_stability_assess" and _PRECLINICAL_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(
+            refua_preclinical_stability_assess(**kwargs)
+        )
+    if tool_name == "refua_preclinical_release_assess" and _PRECLINICAL_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(
+            refua_preclinical_release_assess(**kwargs)
+        )
     return None
 
 
@@ -3602,6 +3641,36 @@ def _normalize_preclinical_rows(
     return normalized
 
 
+def _normalize_preclinical_cmc_config(
+    cmc_config: Mapping[str, Any] | None
+) -> dict[str, Any] | None:
+    if cmc_config is None:
+        return None
+    if not isinstance(cmc_config, Mapping):
+        raise ValueError("cmc_config must be an object when provided.")
+    preclinical = _get_preclinical_module()
+    return preclinical.cmc_spec_from_mapping(dict(cmc_config))
+
+
+def _normalize_preclinical_batch_results(
+    batch_results: Mapping[str, Any] | list[dict[str, Any]] | None,
+) -> dict[str, Any] | list[dict[str, Any]] | None:
+    if batch_results is None:
+        return None
+    if isinstance(batch_results, Mapping):
+        return dict(batch_results)
+    if isinstance(batch_results, list):
+        normalized: list[dict[str, Any]] = []
+        for idx, row in enumerate(batch_results):
+            if not isinstance(row, Mapping):
+                raise ValueError(f"batch_results[{idx}] must be an object.")
+            normalized.append(dict(row))
+        return normalized
+    raise ValueError(
+        "batch_results must be an object or array of objects when provided."
+    )
+
+
 if _PRECLINICAL_AVAILABLE:
 
     @mcp.tool()
@@ -3616,6 +3685,24 @@ if _PRECLINICAL_AVAILABLE:
         }
         if include_references:
             payload["references"] = preclinical.latest_preclinical_references()
+            if hasattr(preclinical, "latest_cmc_references"):
+                payload["cmc_references"] = preclinical.latest_cmc_references()
+        if _REFUA_PRECLINICAL_VERSION is not None:
+            payload["refua_preclinical_version"] = _REFUA_PRECLINICAL_VERSION
+        return payload
+
+    @mcp.tool()
+    def refua_preclinical_cmc_templates(
+        *,
+        include_references: bool = True,
+    ) -> dict[str, Any]:
+        """Return default CMC templates for formulation/process/stability/release workflows."""
+        preclinical = _get_preclinical_module()
+        payload: dict[str, Any] = {
+            "templates": preclinical.default_cmc_templates(),
+        }
+        if include_references and hasattr(preclinical, "latest_cmc_references"):
+            payload["references"] = preclinical.latest_cmc_references()
         if _REFUA_PRECLINICAL_VERSION is not None:
             payload["refua_preclinical_version"] = _REFUA_PRECLINICAL_VERSION
         return payload
@@ -3656,6 +3743,146 @@ if _PRECLINICAL_AVAILABLE:
         }
 
     @mcp.tool()
+    def refua_preclinical_cmc_plan(
+        cmc_config: dict[str, Any] | None = None,
+        *,
+        include_references: bool = True,
+    ) -> dict[str, Any]:
+        """Build CMC formulation/process lifecycle outputs from an optional CMC config."""
+        preclinical = _get_preclinical_module()
+        normalized_cmc = _normalize_preclinical_cmc_config(cmc_config)
+        cmc_plan = preclinical.build_formulation_process_plan(normalized_cmc)
+        payload: dict[str, Any] = {"cmc_plan": cmc_plan}
+        if include_references and hasattr(preclinical, "latest_cmc_references"):
+            payload["references"] = preclinical.latest_cmc_references()
+        return payload
+
+    @mcp.tool()
+    def refua_preclinical_batch_record(
+        cmc_config: dict[str, Any] | None = None,
+        *,
+        batch_id: str = "BATCH-001",
+        operator: str = "TBD",
+        site: str = "TBD",
+        manufacture_date: str | None = None,
+    ) -> dict[str, Any]:
+        """Generate an electronic batch record from an optional CMC config."""
+        preclinical = _get_preclinical_module()
+        normalized_cmc = _normalize_preclinical_cmc_config(cmc_config)
+        batch_record = preclinical.generate_batch_record(
+            normalized_cmc,
+            batch_id=str(batch_id),
+            operator=str(operator),
+            site=str(site),
+            manufacture_date=manufacture_date,
+        )
+        return {"batch_record": batch_record}
+
+    @mcp.tool()
+    def refua_preclinical_stability_plan(
+        cmc_config: dict[str, Any] | None = None,
+        *,
+        batch_ids: list[str] | None = None,
+        include_references: bool = True,
+    ) -> dict[str, Any]:
+        """Build stability schedule/sample plan from an optional CMC config."""
+        preclinical = _get_preclinical_module()
+        normalized_cmc = _normalize_preclinical_cmc_config(cmc_config)
+        normalized_batch_ids = None
+        if isinstance(batch_ids, list):
+            normalized_batch_ids = [
+                str(item).strip() for item in batch_ids if str(item).strip()
+            ]
+        stability_plan = preclinical.build_stability_study_plan(
+            normalized_cmc,
+            batch_ids=normalized_batch_ids,
+        )
+        payload: dict[str, Any] = {"stability_plan": stability_plan}
+        if include_references and hasattr(preclinical, "latest_cmc_references"):
+            payload["references"] = preclinical.latest_cmc_references()
+        return payload
+
+    @mcp.tool()
+    def refua_preclinical_stability_assess(
+        rows: list[dict[str, Any]] | None = None,
+        *,
+        cmc_config: dict[str, Any] | None = None,
+        include_references: bool = False,
+        use_template_rows_when_missing: bool = True,
+    ) -> dict[str, Any]:
+        """Assess stability rows against release criteria and trend summaries."""
+        preclinical = _get_preclinical_module()
+        normalized_rows = rows
+        if normalized_rows is None and use_template_rows_when_missing:
+            templates = preclinical.default_cmc_templates()
+            raw_rows = templates.get("stability_results_rows")
+            if isinstance(raw_rows, list):
+                normalized_rows = [
+                    dict(item) for item in raw_rows if isinstance(item, Mapping)
+                ]
+        if not isinstance(normalized_rows, list):
+            raise ValueError(
+                "rows are required when use_template_rows_when_missing=false."
+            )
+        for idx, row in enumerate(normalized_rows):
+            if not isinstance(row, Mapping):
+                raise ValueError(f"rows[{idx}] must be an object.")
+        normalized_cmc = _normalize_preclinical_cmc_config(cmc_config)
+        criteria = preclinical.build_formulation_process_plan(normalized_cmc)["cmc"][
+            "release_criteria"
+        ]
+        assessment = preclinical.assess_stability_results(
+            [dict(item) for item in normalized_rows],
+            release_criteria=criteria,
+        )
+        payload: dict[str, Any] = {"stability_assessment": assessment}
+        if include_references and hasattr(preclinical, "latest_cmc_references"):
+            payload["references"] = preclinical.latest_cmc_references()
+        return payload
+
+    @mcp.tool()
+    def refua_preclinical_release_assess(
+        batch_results: dict[str, Any] | list[dict[str, Any]],
+        *,
+        cmc_config: dict[str, Any] | None = None,
+        stability_results: list[dict[str, Any]] | None = None,
+        include_references: bool = False,
+    ) -> dict[str, Any]:
+        """Evaluate release decision from batch results and optional stability evidence."""
+        preclinical = _get_preclinical_module()
+        normalized_cmc = _normalize_preclinical_cmc_config(cmc_config)
+        normalized_batch_results = _normalize_preclinical_batch_results(batch_results)
+        if normalized_batch_results is None:
+            raise ValueError("batch_results must be provided.")
+        cmc_plan = preclinical.build_formulation_process_plan(normalized_cmc)
+        criteria = cmc_plan["cmc"]["release_criteria"]
+        cqa = cmc_plan["cmc"]["critical_quality_attributes"]
+
+        stability_assessment = None
+        if stability_results is not None:
+            for idx, row in enumerate(stability_results):
+                if not isinstance(row, Mapping):
+                    raise ValueError(f"stability_results[{idx}] must be an object.")
+            stability_assessment = preclinical.assess_stability_results(
+                [dict(item) for item in stability_results],
+                release_criteria=criteria,
+            )
+
+        release_assessment = preclinical.evaluate_release_criteria(
+            batch_results=normalized_batch_results,
+            release_criteria=criteria,
+            stability_assessment=stability_assessment,
+            critical_quality_attributes=cqa,
+        )
+        payload: dict[str, Any] = {
+            "release_assessment": release_assessment,
+            "stability_assessment": stability_assessment,
+        }
+        if include_references and hasattr(preclinical, "latest_cmc_references"):
+            payload["references"] = preclinical.latest_cmc_references()
+        return payload
+
+    @mcp.tool()
     def refua_preclinical_bioanalysis(
         study: dict[str, Any] | None = None,
         *,
@@ -3694,6 +3921,10 @@ if _PRECLINICAL_AVAILABLE:
         samples: list[dict[str, Any]] | None = None,
         seed: int = 7,
         lloq_ng_ml: float = 1.0,
+        cmc_config: dict[str, Any] | None = None,
+        stability_results: list[dict[str, Any]] | None = None,
+        batch_results: dict[str, Any] | list[dict[str, Any]] | None = None,
+        batch_id: str = "BATCH-001",
         include_markdown: bool = False,
         include_references: bool = False,
         use_template_rows_when_missing: bool = False,
@@ -3708,11 +3939,22 @@ if _PRECLINICAL_AVAILABLE:
             field_name="samples",
             use_template_rows_when_missing=bool(use_template_rows_when_missing),
         )
+        normalized_cmc = _normalize_preclinical_cmc_config(cmc_config)
+        normalized_stability_results = _normalize_preclinical_rows(
+            stability_results,
+            field_name="stability_results",
+            use_template_rows_when_missing=False,
+        )
+        normalized_batch_results = _normalize_preclinical_batch_results(batch_results)
         workup = preclinical.build_workup(
             spec,
             samples=normalized_samples,
             seed=int(seed),
             lloq_ng_ml=float(lloq_ng_ml),
+            cmc_config=normalized_cmc,
+            stability_results=normalized_stability_results,
+            batch_results=normalized_batch_results,
+            batch_id=str(batch_id),
         )
         payload: dict[str, Any] = {
             "study_id": str(getattr(spec, "study_id", workup.get("study_id", ""))),
@@ -3726,6 +3968,8 @@ if _PRECLINICAL_AVAILABLE:
                 )
         if include_references:
             payload["references"] = preclinical.latest_preclinical_references()
+            if hasattr(preclinical, "latest_cmc_references"):
+                payload["cmc_references"] = preclinical.latest_cmc_references()
         return payload
 
 
@@ -4328,6 +4572,26 @@ if _PRECLINICAL_AVAILABLE:
             "seed": 7,
             "lloq_ng_ml": 1.0,
             "use_template_rows_when_missing": True,
+            "include_references": True,
+        },
+    }
+    _RECIPE_LIBRARY["preclinical_cmc_plan"] = {
+        "tool": "refua_preclinical_cmc_plan",
+        "args": {
+            "include_references": True,
+        },
+    }
+    _RECIPE_LIBRARY["preclinical_cmc_release"] = {
+        "tool": "refua_preclinical_release_assess",
+        "args": {
+            "batch_results": {
+                "assay_percent": 99.0,
+                "content_uniformity_av": 9.8,
+                "dissolution_q30_percent": 92.0,
+                "total_impurities_percent": 0.7,
+                "water_content_percent": 1.5,
+                "appearance_score": 5.0,
+            },
             "include_references": True,
         },
     }
