@@ -3642,7 +3642,7 @@ def _normalize_preclinical_rows(
 
 
 def _normalize_preclinical_cmc_config(
-    cmc_config: Mapping[str, Any] | None
+    cmc_config: Mapping[str, Any] | None,
 ) -> dict[str, Any] | None:
     if cmc_config is None:
         return None
