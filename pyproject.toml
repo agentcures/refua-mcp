@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "refua-mcp"
-version = "0.7.1"
-description = "MCP server for Refua Boltz2 folding/affinity and BoltzGen design workflows."
+version = "0.8.0"
+description = "MCP server for Refua design, data, clinical, wet-lab, benchmark, regulatory, and deployment workflows."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -51,10 +51,34 @@ observability = [
   "opentelemetry-api>=1.28.0",
 ]
 clinical = [
-  "refua-clinical>=0.7.1",
+  "refua-clinical>=0.8.1",
+]
+data = [
+  "refua-data>=0.7.2",
 ]
 preclinical = [
   "refua-preclinical>=0.7.1",
+]
+wetlab = [
+  "refua-wetlab>=0.7.1",
+]
+bench = [
+  "refua-bench>=0.7.1",
+]
+regulatory = [
+  "refua-regulatory>=0.7.2",
+]
+deploy = [
+  "refua-deploy>=0.7.2",
+]
+ecosystem = [
+  "refua-clinical>=0.8.1",
+  "refua-data>=0.7.2",
+  "refua-preclinical>=0.7.1",
+  "refua-wetlab>=0.7.1",
+  "refua-bench>=0.7.1",
+  "refua-regulatory>=0.7.2",
+  "refua-deploy>=0.7.2",
 ]
 
 [tool.poetry.group.dev.dependencies]

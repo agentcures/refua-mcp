@@ -23,10 +23,28 @@ Clinical trial simulation is optional; install the clinical extra:
 pip install "refua-mcp[clinical]"
 ```
 
+Data catalog/query/source-validation tools are optional; install the data extra:
+
+```bash
+pip install "refua-mcp[data]"
+```
+
 Preclinical planning/scheduling/bioanalysis/CMC tools are optional; install the preclinical extra:
 
 ```bash
 pip install "refua-mcp[preclinical]"
+```
+
+WetLab, benchmark, regulatory, and deployment tools are optional:
+
+```bash
+pip install "refua-mcp[wetlab,bench,regulatory,deploy]"
+```
+
+Install the full project tool surface with:
+
+```bash
+pip install "refua-mcp[ecosystem]"
 ```
 
 OpenTelemetry spans/metrics are optional:
@@ -115,6 +133,7 @@ Security/runtime controls:
 - `refua_data_fetch` (optional): fetch one dataset into local cache.
 - `refua_data_materialize` (optional): materialize one dataset into parquet parts.
 - `refua_data_query` (optional): query filtered rows from materialized parquet data.
+- `refua_data_validate_sources` (optional): validate catalog source URLs/API endpoints.
 - `refua_job`: check status/results for background jobs.
 - `refua_admet_profile` (optional): run model-based ADMET predictions for SMILES strings (requires `refua[admet]`).
 - `refua_clinical_simulator` (optional): run the `refua-clinical` simulator and optional workup (requires `refua-mcp[clinical]`).
@@ -129,6 +148,15 @@ Security/runtime controls:
 - `refua_preclinical_stability_plan` (optional): generate stability study schedules.
 - `refua_preclinical_stability_assess` (optional): assess stability results against criteria.
 - `refua_preclinical_release_assess` (optional): evaluate release decisions from batch/stability evidence.
+- `refua_wetlab_providers` (optional): list wet-lab automation providers.
+- `refua_wetlab_validate_protocol` (optional): validate canonical wet-lab protocol payloads.
+- `refua_wetlab_compile_protocol` (optional): compile protocols for a provider.
+- `refua_wetlab_run_protocol` (optional): create dry-run or queued wet-lab protocol runs.
+- `refua_wetlab_run_status` (optional): list/fetch/cancel wet-lab runs and build run lineage.
+- `refua_wetlab_lms_get` / `refua_wetlab_lms_post` (optional): access the WetLab LMS resource API.
+- `refua_bench_init`, `refua_bench_run`, `refua_bench_compare`, `refua_bench_gate`, `refua_bench_baseline` (optional): benchmark and regression-gate workflows.
+- `refua_regulatory_bundle`, `refua_regulatory_verify`, `refua_regulatory_summary`, `refua_regulatory_checklist` (optional): regulatory evidence bundle operations.
+- `refua_deploy_plan`, `refua_deploy_render` (optional): deployment planning and artifact rendering.
 
 All major tools expose strict JSON schemas, including discriminated entity unions by `type` and typed output schemas.
 
@@ -173,6 +201,11 @@ Recipe names:
 - `preclinical_workup` (optional; available when `refua-preclinical` is installed)
 - `preclinical_cmc_plan` (optional; available when `refua-preclinical` is installed)
 - `preclinical_cmc_release` (optional; available when `refua-preclinical` is installed)
+- `data_validate_sources` (optional; available when `refua-data` is installed)
+- `wetlab_protocol_run` (optional; available when `refua-wetlab` is installed)
+- `bench_init` (optional; available when `refua-bench` is installed)
+- `regulatory_verify` (optional; available when `refua-regulatory` is installed)
+- `deploy_plan` (optional; available when `refua-deploy` is installed)
 
 ## Workflow
 
@@ -182,7 +215,7 @@ Recommended call sequence:
 2. Read `refua://capabilities` for runtime support and limits.
 3. For sequence-only property analysis, call `refua_protein_properties`.
 4. Call `refua_validate_spec` to catch schema/logic issues before expensive runs (`deep_validate=true` for asset-backed construction checks).
-5. Execute `refua_fold`, `refua_affinity`, `refua_antibody_design`, `refua_clinical_simulator` (optional), or the `refua_preclinical_*` tools (optional).
+5. Execute `refua_fold`, `refua_affinity`, `refua_antibody_design`, `refua_clinical_simulator` (optional), `refua_wetlab_*` (optional), or the `refua_preclinical_*` tools (optional).
 6. For long runs, set `async_mode=true` and poll `refua_job`.
 
 ## Examples

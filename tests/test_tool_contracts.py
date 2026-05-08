@@ -24,6 +24,7 @@ def test_data_tool_registration_matches_dependency() -> None:
         "refua_data_fetch",
         "refua_data_materialize",
         "refua_data_query",
+        "refua_data_validate_sources",
     }
     if server._DATA_AVAILABLE:
         assert data_tools.issubset(tool_names)
@@ -50,6 +51,64 @@ def test_preclinical_tool_registration_matches_dependency() -> None:
         assert preclinical_tools.issubset(tool_names)
     else:
         assert preclinical_tools.isdisjoint(tool_names)
+
+
+def test_wetlab_tool_registration_matches_dependency() -> None:
+    tool_names = {info.name for info in server.mcp._tool_manager.list_tools()}
+    wetlab_tools = {
+        "refua_wetlab_providers",
+        "refua_wetlab_validate_protocol",
+        "refua_wetlab_compile_protocol",
+        "refua_wetlab_run_protocol",
+        "refua_wetlab_run_status",
+        "refua_wetlab_lms_get",
+        "refua_wetlab_lms_post",
+    }
+    if server._WETLAB_AVAILABLE:
+        assert wetlab_tools.issubset(tool_names)
+    else:
+        assert wetlab_tools.isdisjoint(tool_names)
+
+
+def test_bench_tool_registration_matches_dependency() -> None:
+    tool_names = {info.name for info in server.mcp._tool_manager.list_tools()}
+    bench_tools = {
+        "refua_bench_init",
+        "refua_bench_run",
+        "refua_bench_compare",
+        "refua_bench_gate",
+        "refua_bench_baseline",
+    }
+    if server._BENCH_AVAILABLE:
+        assert bench_tools.issubset(tool_names)
+    else:
+        assert bench_tools.isdisjoint(tool_names)
+
+
+def test_regulatory_tool_registration_matches_dependency() -> None:
+    tool_names = {info.name for info in server.mcp._tool_manager.list_tools()}
+    regulatory_tools = {
+        "refua_regulatory_bundle",
+        "refua_regulatory_verify",
+        "refua_regulatory_summary",
+        "refua_regulatory_checklist",
+    }
+    if server._REGULATORY_AVAILABLE:
+        assert regulatory_tools.issubset(tool_names)
+    else:
+        assert regulatory_tools.isdisjoint(tool_names)
+
+
+def test_deploy_tool_registration_matches_dependency() -> None:
+    tool_names = {info.name for info in server.mcp._tool_manager.list_tools()}
+    deploy_tools = {
+        "refua_deploy_plan",
+        "refua_deploy_render",
+    }
+    if server._DEPLOY_AVAILABLE:
+        assert deploy_tools.issubset(tool_names)
+    else:
+        assert deploy_tools.isdisjoint(tool_names)
 
 
 def test_refua_fold_schema_uses_discriminated_entities() -> None:

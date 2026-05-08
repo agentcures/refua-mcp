@@ -23,6 +23,10 @@ def test_capabilities_resource_reports_core_runtime_flags() -> None:
     )
     assert payload["features"]["data_available"] == server._DATA_AVAILABLE
     assert payload["features"]["preclinical_available"] == server._PRECLINICAL_AVAILABLE
+    assert payload["features"]["wetlab_available"] == server._WETLAB_AVAILABLE
+    assert payload["features"]["bench_available"] == server._BENCH_AVAILABLE
+    assert payload["features"]["regulatory_available"] == server._REGULATORY_AVAILABLE
+    assert payload["features"]["deploy_available"] == server._DEPLOY_AVAILABLE
 
 
 def test_protein_property_resources_are_exposed() -> None:
@@ -42,9 +46,11 @@ def test_recipe_index_conditionally_includes_clinical_recipe() -> None:
     if server._DATA_AVAILABLE:
         assert "data_materialize" in names
         assert "data_query" in names
+        assert "data_validate_sources" in names
     else:
         assert "data_materialize" not in names
         assert "data_query" not in names
+        assert "data_validate_sources" not in names
     if server._PRECLINICAL_AVAILABLE:
         assert "preclinical_plan" in names
         assert "preclinical_workup" in names
@@ -55,6 +61,22 @@ def test_recipe_index_conditionally_includes_clinical_recipe() -> None:
         assert "preclinical_workup" not in names
         assert "preclinical_cmc_plan" not in names
         assert "preclinical_cmc_release" not in names
+    if server._WETLAB_AVAILABLE:
+        assert "wetlab_protocol_run" in names
+    else:
+        assert "wetlab_protocol_run" not in names
+    if server._BENCH_AVAILABLE:
+        assert "bench_init" in names
+    else:
+        assert "bench_init" not in names
+    if server._REGULATORY_AVAILABLE:
+        assert "regulatory_verify" in names
+    else:
+        assert "regulatory_verify" not in names
+    if server._DEPLOY_AVAILABLE:
+        assert "deploy_plan" in names
+    else:
+        assert "deploy_plan" not in names
 
 
 def test_recipe_completion_suggests_known_recipes() -> None:

@@ -1,7 +1,7 @@
 {
   "name": "refua-mcp",
-  "version": "0.7.1",
-  "description": "Refua MCP server for Boltz2 folding/affinity and BoltzGen design workflows.",
+  "version": "0.8.0",
+  "description": "Refua MCP server for core design, data, clinical, wet-lab, benchmark, regulatory, and deployment workflows.",
   "command": "python3",
   "args": ["-m", "refua_mcp.server"]
 }

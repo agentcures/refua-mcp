@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import io
 import importlib.util
 import json
 import logging
@@ -13,7 +15,7 @@ import uuid
 from contextlib import contextmanager
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
@@ -59,7 +61,8 @@ Recommended sequence:
 1) Read capability/resource guidance (`refua://capabilities`,
    `refua://recipes/index`, and `refua://recipes/{recipe_name}`).
 2) For data-driven workflows, use `refua_data_list` to discover datasets and
-   `refua_data_materialize` / `refua_data_query` for local dataset access.
+   `refua_data_materialize` / `refua_data_query` for local dataset access;
+   use `refua_data_validate_sources` before CI or data-refresh work.
    For preclinical workflows, use `refua_preclinical_templates` to bootstrap
    specs, then `refua_preclinical_plan` / `refua_preclinical_schedule` /
    `refua_preclinical_bioanalysis` / `refua_preclinical_workup`.
@@ -67,7 +70,10 @@ Recommended sequence:
    `refua_preclinical_cmc_plan`, `refua_preclinical_batch_record`,
    `refua_preclinical_stability_plan`, `refua_preclinical_stability_assess`,
    and `refua_preclinical_release_assess`.
-3) For sequence-only analysis, use `refua_protein_properties`.
+3) For sequence-only analysis, use `refua_protein_properties`. For wet-lab
+   orchestration, use `refua_wetlab_*` tools. For release hygiene, use
+   `refua_bench_*`, `refua_regulatory_*`, and `refua_deploy_*` tools when the
+   corresponding optional packages are installed.
    Use `properties` for explicit property names, or `groups` for grouped summaries.
 4) Call `refua_validate_spec` to normalize/validate before expensive work.
    Do not execute schema probes, sanity folds, or smoke-test designs.
@@ -297,6 +303,26 @@ try:  # noqa: SIM105
 except PackageNotFoundError:
     _REFUA_PRECLINICAL_VERSION = None
 
+try:  # noqa: SIM105
+    _REFUA_WETLAB_VERSION = package_version("refua-wetlab")
+except PackageNotFoundError:
+    _REFUA_WETLAB_VERSION = None
+
+try:  # noqa: SIM105
+    _REFUA_BENCH_VERSION = package_version("refua-bench")
+except PackageNotFoundError:
+    _REFUA_BENCH_VERSION = None
+
+try:  # noqa: SIM105
+    _REFUA_REGULATORY_VERSION = package_version("refua-regulatory")
+except PackageNotFoundError:
+    _REFUA_REGULATORY_VERSION = None
+
+try:  # noqa: SIM105
+    _REFUA_DEPLOY_VERSION = package_version("refua-deploy")
+except PackageNotFoundError:
+    _REFUA_DEPLOY_VERSION = None
+
 try:  # Optional observability dependency.
     from opentelemetry import metrics as otel_metrics  # type: ignore[reportMissingImports]
     from opentelemetry import trace as otel_trace  # type: ignore[reportMissingImports]
@@ -426,6 +452,79 @@ def _preclinical_available() -> bool:
     return all(hasattr(preclinical, name) for name in required_exports)
 
 
+def _wetlab_available() -> bool:
+    if not _module_available("refua_wetlab"):
+        return False
+    try:
+        from refua_wetlab import LmsApi, LmsStore, UnifiedWetLabEngine
+        from refua_wetlab.lineage import build_wetlab_lineage_event
+        from refua_wetlab.runner import RunBackgroundRunner
+        from refua_wetlab.storage import RunStore
+    except Exception:
+        return False
+    return all(
+        item is not None
+        for item in (
+            LmsApi,
+            LmsStore,
+            UnifiedWetLabEngine,
+            RunBackgroundRunner,
+            RunStore,
+            build_wetlab_lineage_event,
+        )
+    )
+
+
+def _bench_available() -> bool:
+    if not _module_available("refua_bench"):
+        return False
+    try:
+        from refua_bench.cli import main as bench_main
+    except Exception:
+        return False
+    return callable(bench_main)
+
+
+def _regulatory_available() -> bool:
+    if not _module_available("refua_regulatory"):
+        return False
+    try:
+        import refua_regulatory
+    except Exception:
+        return False
+    required_exports = (
+        "build_evidence_bundle",
+        "verify_evidence_bundle",
+        "load_bundle_summary",
+        "available_checklist_templates",
+        "evaluate_regulatory_checklist",
+        "render_checklist_markdown",
+    )
+    return all(hasattr(refua_regulatory, name) for name in required_exports)
+
+
+def _deploy_available() -> bool:
+    if not _module_available("refua_deploy"):
+        return False
+    try:
+        from refua_deploy.config import load_spec, spec_from_mapping
+        from refua_deploy.integration import discover_workspace
+        from refua_deploy.planner import build_plan
+        from refua_deploy.renderers import render_bundle
+    except Exception:
+        return False
+    return all(
+        callable(item)
+        for item in (
+            load_spec,
+            spec_from_mapping,
+            discover_workspace,
+            build_plan,
+            render_bundle,
+        )
+    )
+
+
 def _get_clinical_study_cls() -> Any:
     from refua_clinical import ClinicalStudy  # type: ignore[import-not-found]
 
@@ -442,6 +541,10 @@ _ADMET_AVAILABLE = _admet_available()
 _CLINICAL_AVAILABLE = _clinical_available()
 _DATA_AVAILABLE = _data_available()
 _PRECLINICAL_AVAILABLE = _preclinical_available()
+_WETLAB_AVAILABLE = _wetlab_available()
+_BENCH_AVAILABLE = _bench_available()
+_REGULATORY_AVAILABLE = _regulatory_available()
+_DEPLOY_AVAILABLE = _deploy_available()
 _PROBE_RUN_NAME_RE = re.compile(
     r"(sanity|probe|schema|smoke|dry[_\-\s]?run)",
     re.IGNORECASE,
@@ -457,6 +560,15 @@ def _normalize_cache_root(cache_root: str | None) -> str | None:
     return str(Path(text).expanduser().resolve())
 
 
+def _normalize_optional_path(path: str | Path | None) -> Path | None:
+    if path is None:
+        return None
+    text = str(path).strip()
+    if not text:
+        return None
+    return Path(text).expanduser().resolve()
+
+
 @lru_cache(maxsize=8)
 def _get_refua_data_manager(cache_root: str | None) -> Any:
     from refua_data import DataCache, DatasetManager  # type: ignore[import-not-found]
@@ -464,6 +576,79 @@ def _get_refua_data_manager(cache_root: str | None) -> Any:
     if cache_root is None:
         return DatasetManager()
     return DatasetManager(cache=DataCache(Path(cache_root)))
+
+
+@lru_cache(maxsize=8)
+def _get_wetlab_runtime(db_path: str | None) -> tuple[Any, Any, Any, Any]:
+    from refua_wetlab import LmsApi, LmsStore, UnifiedWetLabEngine
+    from refua_wetlab.runner import RunBackgroundRunner
+    from refua_wetlab.storage import RunStore
+
+    resolved_path = (
+        Path(db_path)
+        if db_path is not None
+        else Path(
+            os.environ.get(
+                "REFUA_WETLAB_DB_PATH",
+                "~/.cache/refua-wetlab/runs.sqlite3",
+            )
+        )
+    )
+    resolved_path = resolved_path.expanduser().resolve()
+    run_store = RunStore(resolved_path)
+    lms_store = LmsStore(resolved_path)
+    runner = RunBackgroundRunner(run_store, max_workers=2)
+    engine = UnifiedWetLabEngine()
+    api = LmsApi(
+        lms_store=lms_store,
+        run_store=run_store,
+        runner=runner,
+        engine=engine,
+    )
+    return api, engine, run_store, runner
+
+
+def _normalize_wetlab_db_path(db_path: str | None) -> str | None:
+    path = _normalize_optional_path(db_path)
+    return None if path is None else str(path)
+
+
+def _run_refua_bench_cli(argv: list[str]) -> dict[str, Any]:
+    from refua_bench.cli import main as bench_main
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        exit_code = int(bench_main(argv))
+    return {
+        "exit_code": exit_code,
+        "ok": exit_code == 0,
+        "argv": list(argv),
+        "stdout": stdout.getvalue(),
+        "stderr": stderr.getvalue(),
+    }
+
+
+def _append_optional_cli_arg(argv: list[str], flag: str, value: Any) -> None:
+    if value is not None:
+        argv.extend([flag, str(value)])
+
+
+def _append_bool_cli_arg(argv: list[str], flag: str, value: bool) -> None:
+    if bool(value):
+        argv.append(flag)
+
+
+def _load_deploy_spec(spec: Mapping[str, Any] | None, spec_path: str | None) -> Any:
+    from refua_deploy.config import load_spec, spec_from_mapping
+
+    if spec_path is not None and str(spec_path).strip():
+        return load_spec(Path(spec_path).expanduser().resolve())
+    if spec is None:
+        raise ValueError("Provide either spec or spec_path.")
+    if not isinstance(spec, Mapping):
+        raise ValueError("spec must be an object when provided.")
+    return spec_from_mapping(spec)
 
 
 def _normalize_string_column_list(value: Any, *, field_name: str) -> list[str] | None:
@@ -1059,6 +1244,7 @@ if _DATA_AVAILABLE:
     _TASK_SUPPORT_BY_TOOL["refua_data_fetch"] = "optional"
     _TASK_SUPPORT_BY_TOOL["refua_data_materialize"] = "optional"
     _TASK_SUPPORT_BY_TOOL["refua_data_query"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_data_validate_sources"] = "optional"
 if _PRECLINICAL_AVAILABLE:
     _TASK_SUPPORT_BY_TOOL["refua_preclinical_templates"] = "optional"
     _TASK_SUPPORT_BY_TOOL["refua_preclinical_plan"] = "optional"
@@ -1071,6 +1257,28 @@ if _PRECLINICAL_AVAILABLE:
     _TASK_SUPPORT_BY_TOOL["refua_preclinical_stability_plan"] = "optional"
     _TASK_SUPPORT_BY_TOOL["refua_preclinical_stability_assess"] = "optional"
     _TASK_SUPPORT_BY_TOOL["refua_preclinical_release_assess"] = "optional"
+if _WETLAB_AVAILABLE:
+    _TASK_SUPPORT_BY_TOOL["refua_wetlab_providers"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_wetlab_validate_protocol"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_wetlab_compile_protocol"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_wetlab_run_protocol"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_wetlab_run_status"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_wetlab_lms_get"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_wetlab_lms_post"] = "optional"
+if _BENCH_AVAILABLE:
+    _TASK_SUPPORT_BY_TOOL["refua_bench_init"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_bench_run"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_bench_compare"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_bench_gate"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_bench_baseline"] = "optional"
+if _REGULATORY_AVAILABLE:
+    _TASK_SUPPORT_BY_TOOL["refua_regulatory_bundle"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_regulatory_verify"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_regulatory_summary"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_regulatory_checklist"] = "optional"
+if _DEPLOY_AVAILABLE:
+    _TASK_SUPPORT_BY_TOOL["refua_deploy_plan"] = "optional"
+    _TASK_SUPPORT_BY_TOOL["refua_deploy_render"] = "optional"
 
 
 def _clamp_seconds(value: float, minimum: int, maximum: int) -> int:
@@ -1261,6 +1469,8 @@ def _build_task_runner(
         return lambda: _coerce_tool_result_dict(refua_data_materialize(**kwargs))
     if tool_name == "refua_data_query" and _DATA_AVAILABLE:
         return lambda: _coerce_tool_result_dict(refua_data_query(**kwargs))
+    if tool_name == "refua_data_validate_sources" and _DATA_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_data_validate_sources(**kwargs))
     if tool_name == "refua_preclinical_templates" and _PRECLINICAL_AVAILABLE:
         return lambda: _coerce_tool_result_dict(refua_preclinical_templates(**kwargs))
     if tool_name == "refua_preclinical_plan" and _PRECLINICAL_AVAILABLE:
@@ -1293,6 +1503,44 @@ def _build_task_runner(
         return lambda: _coerce_tool_result_dict(
             refua_preclinical_release_assess(**kwargs)
         )
+    if tool_name == "refua_wetlab_providers" and _WETLAB_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_wetlab_providers(**kwargs))
+    if tool_name == "refua_wetlab_validate_protocol" and _WETLAB_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(
+            refua_wetlab_validate_protocol(**kwargs)
+        )
+    if tool_name == "refua_wetlab_compile_protocol" and _WETLAB_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_wetlab_compile_protocol(**kwargs))
+    if tool_name == "refua_wetlab_run_protocol" and _WETLAB_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_wetlab_run_protocol(**kwargs))
+    if tool_name == "refua_wetlab_run_status" and _WETLAB_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_wetlab_run_status(**kwargs))
+    if tool_name == "refua_wetlab_lms_get" and _WETLAB_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_wetlab_lms_get(**kwargs))
+    if tool_name == "refua_wetlab_lms_post" and _WETLAB_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_wetlab_lms_post(**kwargs))
+    if tool_name == "refua_bench_init" and _BENCH_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_bench_init(**kwargs))
+    if tool_name == "refua_bench_run" and _BENCH_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_bench_run(**kwargs))
+    if tool_name == "refua_bench_compare" and _BENCH_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_bench_compare(**kwargs))
+    if tool_name == "refua_bench_gate" and _BENCH_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_bench_gate(**kwargs))
+    if tool_name == "refua_bench_baseline" and _BENCH_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_bench_baseline(**kwargs))
+    if tool_name == "refua_regulatory_bundle" and _REGULATORY_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_regulatory_bundle(**kwargs))
+    if tool_name == "refua_regulatory_verify" and _REGULATORY_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_regulatory_verify(**kwargs))
+    if tool_name == "refua_regulatory_summary" and _REGULATORY_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_regulatory_summary(**kwargs))
+    if tool_name == "refua_regulatory_checklist" and _REGULATORY_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_regulatory_checklist(**kwargs))
+    if tool_name == "refua_deploy_plan" and _DEPLOY_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_deploy_plan(**kwargs))
+    if tool_name == "refua_deploy_render" and _DEPLOY_AVAILABLE:
+        return lambda: _coerce_tool_result_dict(refua_deploy_render(**kwargs))
     return None
 
 
@@ -4304,6 +4552,577 @@ if _DATA_AVAILABLE:
             "manifest_path": manifest_path_text,
         }
 
+    @mcp.tool()
+    def refua_data_validate_sources(
+        *,
+        dataset_ids: list[str] | tuple[str, ...] | None = None,
+        tag: str | None = None,
+        timeout_seconds: float = 10.0,
+        cache_root: str | None = None,
+        limit: int = 50,
+        fail_on_error: bool = False,
+    ) -> dict[str, Any]:
+        """Validate configured refua-data source URLs/API endpoints."""
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0.")
+        if limit < 1:
+            raise ValueError("limit must be >= 1.")
+
+        from refua_data.validation import validate_dataset_sources
+
+        resolved_cache_root = _normalize_cache_root(cache_root)
+        manager = _get_refua_data_manager(resolved_cache_root)
+        if dataset_ids is not None:
+            selected_ids = [
+                str(item).strip() for item in dataset_ids if str(item).strip()
+            ]
+            datasets = [manager.catalog.get(dataset_id) for dataset_id in selected_ids]
+        else:
+            tag_value = str(tag).strip() if tag is not None else None
+            datasets = manager.list_datasets(tag=tag_value or None)[: int(limit)]
+
+        results: list[dict[str, Any]] = []
+        ok_count = 0
+        for dataset in datasets:
+            source_results = validate_dataset_sources(
+                dataset,
+                timeout_seconds=float(timeout_seconds),
+            )
+            dataset_results = [asdict(item) for item in source_results]
+            dataset_ok = all(bool(item.get("ok")) for item in dataset_results)
+            if dataset_ok:
+                ok_count += 1
+            results.append(
+                {
+                    "dataset_id": dataset.dataset_id,
+                    "version": dataset.version,
+                    "ok": dataset_ok,
+                    "sources": dataset_results,
+                }
+            )
+
+        failed = len(results) - ok_count
+        if fail_on_error and failed:
+            raise RuntimeError(f"{failed} dataset source validation checks failed.")
+
+        return {
+            "count": len(results),
+            "ok": ok_count,
+            "failed": failed,
+            "datasets": results,
+            "cache_root": resolved_cache_root,
+        }
+
+
+if _WETLAB_AVAILABLE:
+
+    @mcp.tool()
+    def refua_wetlab_providers(*, db_path: str | None = None) -> dict[str, Any]:
+        """List available simulated wet-lab automation providers."""
+        resolved_db_path = _normalize_wetlab_db_path(db_path)
+        _api, engine, _store, _runner = _get_wetlab_runtime(resolved_db_path)
+        providers = engine.list_providers()
+        return {
+            "providers": providers,
+            "count": len(providers),
+            "db_path": resolved_db_path,
+        }
+
+    @mcp.tool()
+    def refua_wetlab_validate_protocol(
+        protocol: dict[str, Any],
+        *,
+        db_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate and normalize a canonical wet-lab protocol payload."""
+        resolved_db_path = _normalize_wetlab_db_path(db_path)
+        _api, engine, _store, _runner = _get_wetlab_runtime(resolved_db_path)
+        return {
+            "valid": True,
+            "protocol": engine.validate_protocol(protocol),
+            "db_path": resolved_db_path,
+        }
+
+    @mcp.tool()
+    def refua_wetlab_compile_protocol(
+        provider: str,
+        protocol: dict[str, Any],
+        *,
+        db_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Compile a wet-lab protocol for a named provider."""
+        resolved_db_path = _normalize_wetlab_db_path(db_path)
+        _api, engine, _store, _runner = _get_wetlab_runtime(resolved_db_path)
+        payload = engine.compile_protocol(
+            provider_id=str(provider).strip(),
+            protocol_payload=protocol,
+        )
+        payload["db_path"] = resolved_db_path
+        return payload
+
+    @mcp.tool()
+    def refua_wetlab_run_protocol(
+        provider: str,
+        protocol: dict[str, Any],
+        *,
+        dry_run: bool = True,
+        async_mode: bool = True,
+        priority: int = 50,
+        metadata: dict[str, Any] | None = None,
+        db_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a wet-lab run, optionally queued in the wet-lab runner."""
+        resolved_db_path = _normalize_wetlab_db_path(db_path)
+        api, _engine, _store, _runner = _get_wetlab_runtime(resolved_db_path)
+        payload = api.create_run(
+            {
+                "provider": str(provider).strip(),
+                "protocol": protocol,
+                "dry_run": bool(dry_run),
+                "async_mode": bool(async_mode),
+                "priority": int(priority),
+                "metadata": metadata or {},
+            }
+        )
+        payload["db_path"] = resolved_db_path
+        return payload
+
+    @mcp.tool()
+    def refua_wetlab_run_status(
+        *,
+        run_id: str | None = None,
+        limit: int = 100,
+        statuses: list[str] | tuple[str, ...] | None = None,
+        include_lineage: bool = False,
+        cancel: bool = False,
+        db_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch, list, cancel, or derive lineage for wet-lab runs."""
+        resolved_db_path = _normalize_wetlab_db_path(db_path)
+        api, _engine, store, runner = _get_wetlab_runtime(resolved_db_path)
+        if run_id is not None and str(run_id).strip():
+            resolved_run_id = str(run_id).strip()
+            if cancel:
+                payload = runner.cancel(resolved_run_id)
+            elif include_lineage:
+                from refua_wetlab.lineage import build_wetlab_lineage_event
+
+                run = store.get_run(resolved_run_id)
+                if run is None:
+                    raise ValueError(f"Unknown run_id: {resolved_run_id}")
+                result = run.get("result")
+                if not isinstance(result, dict):
+                    result = {
+                        "provider": run.get("provider"),
+                        "execution": {"status": run.get("status")},
+                        "metadata": {},
+                    }
+                payload = build_wetlab_lineage_event(result, run_id=resolved_run_id)
+                payload["run_status"] = run.get("status")
+            else:
+                run = store.get_run(resolved_run_id)
+                if run is None:
+                    raise ValueError(f"Unknown run_id: {resolved_run_id}")
+                payload = {"run": run}
+        else:
+            del api
+            payload = {
+                "runs": store.list_runs(
+                    limit=int(limit),
+                    statuses=(
+                        tuple(str(item) for item in statuses)
+                        if statuses is not None
+                        else None
+                    ),
+                ),
+                "counts": store.status_counts(),
+            }
+        payload["db_path"] = resolved_db_path
+        return payload
+
+    @mcp.tool()
+    def refua_wetlab_lms_get(
+        path: str,
+        *,
+        query: dict[str, Any] | None = None,
+        db_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Call a wet-lab LMS GET route such as /api/lms/summary."""
+        resolved_db_path = _normalize_wetlab_db_path(db_path)
+        api, _engine, _store, _runner = _get_wetlab_runtime(resolved_db_path)
+        payload = api.route_get(path=str(path), query=query or {})
+        payload["db_path"] = resolved_db_path
+        return payload
+
+    @mcp.tool()
+    def refua_wetlab_lms_post(
+        path: str,
+        payload: dict[str, Any],
+        *,
+        db_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Call a wet-lab LMS POST route such as /api/lms/projects."""
+        resolved_db_path = _normalize_wetlab_db_path(db_path)
+        api, _engine, _store, _runner = _get_wetlab_runtime(resolved_db_path)
+        response = api.route_post(path=str(path), payload=payload)
+        response["db_path"] = resolved_db_path
+        return response
+
+
+if _BENCH_AVAILABLE:
+
+    @mcp.tool()
+    def refua_bench_init(
+        directory: str,
+        *,
+        name: str = "my-refua-suite",
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Scaffold a refua-bench suite and starter baseline artifacts."""
+        argv = ["init", "--directory", str(directory), "--name", str(name)]
+        _append_bool_cli_arg(argv, "--force", force)
+        payload = _run_refua_bench_cli(argv)
+        out_dir = Path(directory).expanduser().resolve()
+        payload["artifacts"] = [
+            str(out_dir / name)
+            for name in (
+                "suite.yaml",
+                "baseline.json",
+                "candidate_predictions.json",
+                "command_adapter_config.yaml",
+                "adapter_command.py",
+            )
+        ]
+        return payload
+
+    @mcp.tool()
+    def refua_bench_run(
+        suite: str,
+        adapter: str,
+        output: str,
+        *,
+        adapter_config: str | None = None,
+        markdown: str | None = None,
+        model_name: str | None = None,
+        model_version: str | None = None,
+        model_params: str | None = None,
+        provenance_extra: str | None = None,
+        no_provenance: bool = False,
+        fail_on_errors: bool = False,
+    ) -> dict[str, Any]:
+        """Run a refua-bench suite and write a run artifact."""
+        argv = ["run", "--suite", suite, "--adapter", adapter, "--output", output]
+        _append_optional_cli_arg(argv, "--adapter-config", adapter_config)
+        _append_optional_cli_arg(argv, "--markdown", markdown)
+        _append_optional_cli_arg(argv, "--model-name", model_name)
+        _append_optional_cli_arg(argv, "--model-version", model_version)
+        _append_optional_cli_arg(argv, "--model-params", model_params)
+        _append_optional_cli_arg(argv, "--provenance-extra", provenance_extra)
+        _append_bool_cli_arg(argv, "--no-provenance", no_provenance)
+        _append_bool_cli_arg(argv, "--fail-on-errors", fail_on_errors)
+        payload = _run_refua_bench_cli(argv)
+        output_path = Path(output).expanduser().resolve()
+        if output_path.exists():
+            payload["run"] = json.loads(output_path.read_text(encoding="utf-8"))
+        return payload
+
+    @mcp.tool()
+    def refua_bench_compare(
+        suite: str,
+        candidate: str,
+        output: str,
+        *,
+        baseline: str | None = None,
+        registry: str | None = None,
+        baseline_name: str | None = None,
+        markdown: str | None = None,
+        min_effect_size: float = 0.0,
+        bootstrap_resamples: int = 0,
+        confidence_level: float = 0.95,
+        bootstrap_seed: int | None = None,
+        no_fail_on_regression: bool = False,
+        fail_on_uncertain: bool = False,
+    ) -> dict[str, Any]:
+        """Compare candidate and baseline refua-bench run artifacts."""
+        argv = [
+            "compare",
+            "--suite",
+            suite,
+            "--candidate",
+            candidate,
+            "--output",
+            output,
+        ]
+        _append_optional_cli_arg(argv, "--baseline", baseline)
+        _append_optional_cli_arg(argv, "--registry", registry)
+        _append_optional_cli_arg(argv, "--baseline-name", baseline_name)
+        _append_optional_cli_arg(argv, "--markdown", markdown)
+        argv.extend(["--min-effect-size", str(min_effect_size)])
+        argv.extend(["--bootstrap-resamples", str(bootstrap_resamples)])
+        argv.extend(["--confidence-level", str(confidence_level)])
+        _append_optional_cli_arg(argv, "--bootstrap-seed", bootstrap_seed)
+        _append_bool_cli_arg(argv, "--no-fail-on-regression", no_fail_on_regression)
+        _append_bool_cli_arg(argv, "--fail-on-uncertain", fail_on_uncertain)
+        payload = _run_refua_bench_cli(argv)
+        output_path = Path(output).expanduser().resolve()
+        if output_path.exists():
+            payload["comparison"] = json.loads(output_path.read_text(encoding="utf-8"))
+        return payload
+
+    @mcp.tool()
+    def refua_bench_gate(
+        suite: str,
+        adapter: str,
+        candidate_output: str,
+        output: str,
+        *,
+        adapter_config: str | None = None,
+        baseline: str | None = None,
+        registry: str | None = None,
+        baseline_name: str | None = None,
+        markdown: str | None = None,
+        model_name: str | None = None,
+        model_version: str | None = None,
+        model_params: str | None = None,
+        provenance_extra: str | None = None,
+        no_provenance: bool = False,
+        min_effect_size: float = 0.0,
+        bootstrap_resamples: int = 0,
+        confidence_level: float = 0.95,
+        bootstrap_seed: int | None = None,
+        no_fail_on_regression: bool = False,
+        fail_on_uncertain: bool = False,
+    ) -> dict[str, Any]:
+        """Run a benchmark and compare against a baseline in one step."""
+        argv = [
+            "gate",
+            "--suite",
+            suite,
+            "--adapter",
+            adapter,
+            "--candidate-output",
+            candidate_output,
+            "--output",
+            output,
+        ]
+        _append_optional_cli_arg(argv, "--adapter-config", adapter_config)
+        _append_optional_cli_arg(argv, "--baseline", baseline)
+        _append_optional_cli_arg(argv, "--registry", registry)
+        _append_optional_cli_arg(argv, "--baseline-name", baseline_name)
+        _append_optional_cli_arg(argv, "--markdown", markdown)
+        _append_optional_cli_arg(argv, "--model-name", model_name)
+        _append_optional_cli_arg(argv, "--model-version", model_version)
+        _append_optional_cli_arg(argv, "--model-params", model_params)
+        _append_optional_cli_arg(argv, "--provenance-extra", provenance_extra)
+        _append_bool_cli_arg(argv, "--no-provenance", no_provenance)
+        argv.extend(["--min-effect-size", str(min_effect_size)])
+        argv.extend(["--bootstrap-resamples", str(bootstrap_resamples)])
+        argv.extend(["--confidence-level", str(confidence_level)])
+        _append_optional_cli_arg(argv, "--bootstrap-seed", bootstrap_seed)
+        _append_bool_cli_arg(argv, "--no-fail-on-regression", no_fail_on_regression)
+        _append_bool_cli_arg(argv, "--fail-on-uncertain", fail_on_uncertain)
+        payload = _run_refua_bench_cli(argv)
+        output_path = Path(output).expanduser().resolve()
+        candidate_path = Path(candidate_output).expanduser().resolve()
+        if output_path.exists():
+            payload["comparison"] = json.loads(output_path.read_text(encoding="utf-8"))
+        if candidate_path.exists():
+            payload["candidate_run"] = json.loads(
+                candidate_path.read_text(encoding="utf-8")
+            )
+        return payload
+
+    @mcp.tool()
+    def refua_bench_baseline(
+        action: Literal["list", "resolve", "promote"],
+        registry: str,
+        *,
+        suite: str | None = None,
+        baseline_name: str | None = None,
+        candidate: str | None = None,
+        output: str | None = None,
+        suite_name: str | None = None,
+        store_dir: str | None = None,
+        notes: str | None = None,
+        min_effect_size: float = 0.0,
+        bootstrap_resamples: int = 0,
+        confidence_level: float = 0.95,
+        bootstrap_seed: int | None = None,
+        allow_regression: bool = False,
+        fail_on_uncertain: bool = False,
+    ) -> dict[str, Any]:
+        """List, resolve, or promote refua-bench named baselines."""
+        argv = ["baseline", action, "--registry", registry]
+        if action == "list":
+            _append_optional_cli_arg(argv, "--suite-name", suite_name)
+            _append_optional_cli_arg(argv, "--output", output)
+        elif action == "resolve":
+            if suite is None or baseline_name is None:
+                raise ValueError("suite and baseline_name are required for resolve.")
+            argv.extend(["--suite", suite, "--baseline-name", baseline_name])
+        else:
+            if suite is None or baseline_name is None or candidate is None:
+                raise ValueError(
+                    "suite, baseline_name, and candidate are required for promote."
+                )
+            argv.extend(
+                [
+                    "--suite",
+                    suite,
+                    "--baseline-name",
+                    baseline_name,
+                    "--candidate",
+                    candidate,
+                ]
+            )
+            _append_optional_cli_arg(argv, "--store-dir", store_dir)
+            _append_optional_cli_arg(argv, "--notes", notes)
+            _append_optional_cli_arg(argv, "--output", output)
+            argv.extend(["--min-effect-size", str(min_effect_size)])
+            argv.extend(["--bootstrap-resamples", str(bootstrap_resamples)])
+            argv.extend(["--confidence-level", str(confidence_level)])
+            _append_optional_cli_arg(argv, "--bootstrap-seed", bootstrap_seed)
+            _append_bool_cli_arg(argv, "--allow-regression", allow_regression)
+            _append_bool_cli_arg(argv, "--fail-on-uncertain", fail_on_uncertain)
+        payload = _run_refua_bench_cli(argv)
+        if output is not None:
+            output_path = Path(output).expanduser().resolve()
+            if output_path.exists():
+                payload["output"] = json.loads(output_path.read_text(encoding="utf-8"))
+        return payload
+
+
+if _REGULATORY_AVAILABLE:
+
+    @mcp.tool()
+    def refua_regulatory_bundle(
+        campaign_run_path: str,
+        output_dir: str,
+        *,
+        source_kind: str = "clawcures-ui",
+        bundle_id: str | None = None,
+        data_manifest_paths: list[str] | tuple[str, ...] | None = None,
+        extra_artifacts: list[str] | tuple[str, ...] | None = None,
+        model_name: str | None = None,
+        model_version: str | None = None,
+        include_checklists: bool = True,
+        checklist_templates: list[str] | tuple[str, ...] | None = None,
+        checklist_strict: bool = False,
+        checklist_require_no_manual_review: bool = False,
+        include_sensitive_provenance: bool = False,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Build a regulatory evidence bundle from a campaign run artifact."""
+        from refua_regulatory import build_evidence_bundle
+
+        return build_evidence_bundle(
+            campaign_run_path=Path(campaign_run_path).expanduser().resolve(),
+            output_dir=Path(output_dir).expanduser().resolve(),
+            source_kind=source_kind,
+            bundle_id=bundle_id,
+            data_manifest_paths=[
+                Path(item).expanduser().resolve()
+                for item in (data_manifest_paths or [])
+            ],
+            extra_artifacts=[
+                Path(item).expanduser().resolve() for item in (extra_artifacts or [])
+            ],
+            model_name=model_name,
+            model_version=model_version,
+            include_checklists=bool(include_checklists),
+            checklist_templates=list(checklist_templates or []),
+            checklist_strict=bool(checklist_strict),
+            checklist_require_no_manual_review=bool(checklist_require_no_manual_review),
+            provenance_include_sensitive_details=bool(include_sensitive_provenance),
+            overwrite=bool(overwrite),
+        )
+
+    @mcp.tool()
+    def refua_regulatory_verify(bundle_dir: str) -> dict[str, Any]:
+        """Verify a regulatory evidence bundle checksum inventory."""
+        from refua_regulatory import verify_evidence_bundle
+        from refua_regulatory.utils import to_plain_data
+
+        return to_plain_data(verify_evidence_bundle(Path(bundle_dir).expanduser()))
+
+    @mcp.tool()
+    def refua_regulatory_summary(bundle_dir: str) -> dict[str, Any]:
+        """Load the manifest summary for a regulatory evidence bundle."""
+        from refua_regulatory import load_bundle_summary
+
+        return load_bundle_summary(Path(bundle_dir).expanduser())
+
+    @mcp.tool()
+    def refua_regulatory_checklist(
+        bundle_dir: str,
+        *,
+        template: str = "drug_discovery_comprehensive",
+        output_json: str | None = None,
+        output_markdown: str | None = None,
+    ) -> dict[str, Any]:
+        """Evaluate a regulatory checklist for an evidence bundle."""
+        from refua_regulatory import (
+            evaluate_regulatory_checklist,
+            render_checklist_markdown,
+        )
+        from refua_regulatory.utils import write_json
+
+        report = evaluate_regulatory_checklist(
+            Path(bundle_dir).expanduser(),
+            template=template,
+        )
+        if output_json is not None:
+            write_json(Path(output_json).expanduser().resolve(), report)
+        if output_markdown is not None:
+            markdown_path = Path(output_markdown).expanduser().resolve()
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(
+                render_checklist_markdown(report),
+                encoding="utf-8",
+            )
+        return report
+
+
+if _DEPLOY_AVAILABLE:
+
+    @mcp.tool()
+    def refua_deploy_plan(
+        *,
+        spec: dict[str, Any] | None = None,
+        spec_path: str | None = None,
+        workspace_root: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate a refua-deploy spec and return the planned artifacts."""
+        from refua_deploy.integration import discover_workspace
+        from refua_deploy.planner import build_plan
+
+        deployment_spec = _load_deploy_spec(spec, spec_path)
+        workspace = discover_workspace(_normalize_optional_path(workspace_root))
+        return build_plan(deployment_spec, workspace)
+
+    @mcp.tool()
+    def refua_deploy_render(
+        output_dir: str,
+        *,
+        spec: dict[str, Any] | None = None,
+        spec_path: str | None = None,
+        workspace_root: str | None = None,
+    ) -> dict[str, Any]:
+        """Render refua-deploy artifacts for Kubernetes, compose, or single-machine."""
+        from refua_deploy.integration import discover_workspace
+        from refua_deploy.planner import build_plan
+        from refua_deploy.renderers import render_bundle
+
+        deployment_spec = _load_deploy_spec(spec, spec_path)
+        workspace = discover_workspace(_normalize_optional_path(workspace_root))
+        out_root = Path(output_dir).expanduser().resolve()
+        artifacts = render_bundle(deployment_spec, workspace, out_root)
+        return {
+            "output_dir": str(out_root),
+            "artifacts": [str(path) for path in artifacts],
+            "plan": build_plan(deployment_spec, workspace),
+        }
+
 
 def _capabilities_payload() -> dict[str, Any]:
     try:
@@ -4321,6 +5140,10 @@ def _capabilities_payload() -> dict[str, Any]:
         "refua_clinical_version": _REFUA_CLINICAL_VERSION,
         "refua_data_version": _REFUA_DATA_VERSION,
         "refua_preclinical_version": _REFUA_PRECLINICAL_VERSION,
+        "refua_wetlab_version": _REFUA_WETLAB_VERSION,
+        "refua_bench_version": _REFUA_BENCH_VERSION,
+        "refua_regulatory_version": _REFUA_REGULATORY_VERSION,
+        "refua_deploy_version": _REFUA_DEPLOY_VERSION,
         "runtime": {
             "transport": _RUNTIME_CONFIG.transport,
             "host": _RUNTIME_CONFIG.host,
@@ -4339,6 +5162,10 @@ def _capabilities_payload() -> dict[str, Any]:
             "clinical_simulator_available": _CLINICAL_AVAILABLE,
             "data_available": _DATA_AVAILABLE,
             "preclinical_available": _PRECLINICAL_AVAILABLE,
+            "wetlab_available": _WETLAB_AVAILABLE,
+            "bench_available": _BENCH_AVAILABLE,
+            "regulatory_available": _REGULATORY_AVAILABLE,
+            "deploy_available": _DEPLOY_AVAILABLE,
             "protein_properties_api_available": protein_property_api,
             "otel_available": _OTEL_AVAILABLE,
             "experimental_tasks_enabled": True,
@@ -4549,6 +5376,13 @@ if _DATA_AVAILABLE:
             "limit": 25,
         },
     }
+    _RECIPE_LIBRARY["data_validate_sources"] = {
+        "tool": "refua_data_validate_sources",
+        "args": {
+            "dataset_ids": ["chembl_activity_ki_human"],
+            "timeout_seconds": 10.0,
+        },
+    }
 
 if _CLINICAL_AVAILABLE:
     _RECIPE_LIBRARY["clinical_simulation"] = {
@@ -4599,6 +5433,58 @@ if _PRECLINICAL_AVAILABLE:
                 "appearance_score": 5.0,
             },
             "include_references": True,
+        },
+    }
+
+if _WETLAB_AVAILABLE:
+    _RECIPE_LIBRARY["wetlab_protocol_run"] = {
+        "tool": "refua_wetlab_run_protocol",
+        "args": {
+            "provider": "opentrons",
+            "dry_run": True,
+            "async_mode": False,
+            "protocol": {
+                "name": "serial_dilution_screen",
+                "steps": [
+                    {
+                        "type": "transfer",
+                        "source": "plate:A1",
+                        "destination": "plate:B1",
+                        "volume_ul": 20,
+                    },
+                    {"type": "mix", "well": "plate:B1", "volume_ul": 15, "cycles": 4},
+                    {
+                        "type": "read_absorbance",
+                        "plate": "plate",
+                        "wavelength_nm": 450,
+                    },
+                ],
+            },
+        },
+    }
+
+if _BENCH_AVAILABLE:
+    _RECIPE_LIBRARY["bench_init"] = {
+        "tool": "refua_bench_init",
+        "args": {
+            "directory": "benchmarks/refua-smoke",
+            "name": "refua-smoke",
+        },
+    }
+
+if _REGULATORY_AVAILABLE:
+    _RECIPE_LIBRARY["regulatory_verify"] = {
+        "tool": "refua_regulatory_verify",
+        "args": {
+            "bundle_dir": "artifacts/regulatory-bundle",
+        },
+    }
+
+if _DEPLOY_AVAILABLE:
+    _RECIPE_LIBRARY["deploy_plan"] = {
+        "tool": "refua_deploy_plan",
+        "args": {
+            "spec_path": "refua-deploy/examples/private_onprem.yaml",
         },
     }
 

@@ -22,13 +22,25 @@ def _server_python() -> str:
     return sys.executable
 
 
+def _server_pythonpath() -> str:
+    paths = [str(ROOT / "src")]
+    extra = os.environ.get("PYTHONPATH")
+    if extra:
+        paths.extend(
+            str(Path(item).expanduser().resolve())
+            for item in extra.split(os.pathsep)
+            if item
+        )
+    return os.pathsep.join(paths)
+
+
 async def _with_session() -> tuple[ClientSession, object]:
     params = StdioServerParameters(
         command=_server_python(),
         args=["-m", "refua_mcp.server"],
         cwd=ROOT,
         env={
-            "PYTHONPATH": str(ROOT / "src"),
+            "PYTHONPATH": _server_pythonpath(),
             "REFUA_MCP_TRANSPORT": "stdio",
         },
     )
