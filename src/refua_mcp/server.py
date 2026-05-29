@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import io
 import importlib.util
+import io
 import json
 import logging
 import os
@@ -12,14 +12,16 @@ import statistics
 import threading
 import time
 import uuid
-from contextlib import contextmanager
 from collections import OrderedDict
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
-from importlib.metadata import PackageNotFoundError, version as package_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Callable, Iterable, Literal, Mapping
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import anyio
 from mcp.server.fastmcp import FastMCP
@@ -30,12 +32,12 @@ from mcp.types import (
     Completion,
     PromptReference,
     ResourceTemplateReference,
+    TaskExecutionMode,
+    TasksCallCapability,
     TextContent,
+    ToolExecution,
 )
-from mcp.types import TaskExecutionMode
-from mcp.types import TasksCallCapability
 from mcp.types import Tool as McpTool
-from mcp.types import ToolExecution
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 if TYPE_CHECKING:
@@ -278,53 +280,28 @@ mcp = FastMCP(
     transport_security=_RUNTIME_CONFIG.transport_security,
 )
 
-try:  # noqa: SIM105
-    _MCP_SDK_VERSION = package_version("mcp")
-except PackageNotFoundError:
-    _MCP_SDK_VERSION = None
 
-try:  # noqa: SIM105
-    _REFUA_VERSION = package_version("refua")
-except PackageNotFoundError:
-    _REFUA_VERSION = None
+def _optional_package_version(package_name: str) -> str | None:
+    try:
+        return package_version(package_name)
+    except PackageNotFoundError:
+        return None
 
-try:  # noqa: SIM105
-    _REFUA_CLINICAL_VERSION = package_version("refua-clinical")
-except PackageNotFoundError:
-    _REFUA_CLINICAL_VERSION = None
 
-try:  # noqa: SIM105
-    _REFUA_DATA_VERSION = package_version("refua-data")
-except PackageNotFoundError:
-    _REFUA_DATA_VERSION = None
-
-try:  # noqa: SIM105
-    _REFUA_PRECLINICAL_VERSION = package_version("refua-preclinical")
-except PackageNotFoundError:
-    _REFUA_PRECLINICAL_VERSION = None
-
-try:  # noqa: SIM105
-    _REFUA_WETLAB_VERSION = package_version("refua-wetlab")
-except PackageNotFoundError:
-    _REFUA_WETLAB_VERSION = None
-
-try:  # noqa: SIM105
-    _REFUA_BENCH_VERSION = package_version("refua-bench")
-except PackageNotFoundError:
-    _REFUA_BENCH_VERSION = None
-
-try:  # noqa: SIM105
-    _REFUA_REGULATORY_VERSION = package_version("refua-regulatory")
-except PackageNotFoundError:
-    _REFUA_REGULATORY_VERSION = None
-
-try:  # noqa: SIM105
-    _REFUA_DEPLOY_VERSION = package_version("refua-deploy")
-except PackageNotFoundError:
-    _REFUA_DEPLOY_VERSION = None
+_MCP_SDK_VERSION = _optional_package_version("mcp")
+_REFUA_VERSION = _optional_package_version("refua")
+_REFUA_CLINICAL_VERSION = _optional_package_version("refua-clinical")
+_REFUA_DATA_VERSION = _optional_package_version("refua-data")
+_REFUA_PRECLINICAL_VERSION = _optional_package_version("refua-preclinical")
+_REFUA_WETLAB_VERSION = _optional_package_version("refua-wetlab")
+_REFUA_BENCH_VERSION = _optional_package_version("refua-bench")
+_REFUA_REGULATORY_VERSION = _optional_package_version("refua-regulatory")
+_REFUA_DEPLOY_VERSION = _optional_package_version("refua-deploy")
 
 try:  # Optional observability dependency.
-    from opentelemetry import metrics as otel_metrics  # type: ignore[reportMissingImports]
+    from opentelemetry import (
+        metrics as otel_metrics,  # type: ignore[reportMissingImports]
+    )
     from opentelemetry import trace as otel_trace  # type: ignore[reportMissingImports]
 except Exception:  # pragma: no cover - environment dependent optional import.
     otel_metrics = None
@@ -806,10 +783,7 @@ def _error_contract_from_exception(exc: Exception) -> dict[str, Any]:
     retryable = False
     exception_name = type(exc).__name__
 
-    if isinstance(exc, ValueError):
-        code = "invalid_input"
-        hint = "Check tool arguments against the published schema."
-    elif exception_name in {"ValidationError"}:
+    if isinstance(exc, ValueError) or exception_name in {"ValidationError"}:
         code = "invalid_input"
         hint = "Check tool arguments against the published schema."
     elif exception_name in {"ToolError"}:
@@ -877,7 +851,7 @@ class ChainEntitySpec(StrictModel):
     ids: list[str] | tuple[str, ...] | None = None
 
     @model_validator(mode="after")
-    def _validate_id_fields(self) -> "ChainEntitySpec":
+    def _validate_id_fields(self) -> ChainEntitySpec:
         if self.id is not None and self.ids is not None:
             raise ValueError("Use either id or ids, not both.")
         if self.ids is not None and len(self.ids) == 0:
@@ -933,7 +907,7 @@ class BinderEntity(ChainEntitySpec):
     template_values: dict[str, Any] | None = None
 
     @model_validator(mode="after")
-    def _validate_binder_input(self) -> "BinderEntity":
+    def _validate_binder_input(self) -> BinderEntity:
         if self.length is not None and self.length < 1:
             raise ValueError("binder length must be >= 1.")
         if self.spec is None and self.sequence is None and self.length is None:
@@ -956,7 +930,7 @@ class PeptideEntity(ChainEntitySpec):
     template_values: dict[str, Any] | None = None
 
     @model_validator(mode="after")
-    def _validate_peptide_input(self) -> "PeptideEntity":
+    def _validate_peptide_input(self) -> PeptideEntity:
         if self.length is not None and self.length < 1:
             raise ValueError("peptide length must be >= 1.")
         if self.segment_lengths is not None and any(
@@ -987,7 +961,7 @@ class AntibodyEntity(StrictModel):
     light_template_values: dict[str, Any] | None = None
 
     @model_validator(mode="after")
-    def _validate_antibody_input(self) -> "AntibodyEntity":
+    def _validate_antibody_input(self) -> AntibodyEntity:
         if self.ids is not None:
             if len(self.ids) != 2:
                 raise ValueError("antibody ids must include exactly two values.")
@@ -1006,7 +980,7 @@ class LigandEntity(ChainEntitySpec):
     ccd: str | None = None
 
     @model_validator(mode="after")
-    def _validate_ligand_input(self) -> "LigandEntity":
+    def _validate_ligand_input(self) -> LigandEntity:
         if (self.smiles is None) == (self.ccd is None):
             raise ValueError("ligand requires exactly one of smiles or ccd.")
         if self.ids is not None and len(self.ids) != 1:
@@ -1071,7 +1045,7 @@ class PocketConstraint(StrictModel):
     force: bool = False
 
     @model_validator(mode="after")
-    def _validate_contacts(self) -> "PocketConstraint":
+    def _validate_contacts(self) -> PocketConstraint:
         if not self.contacts:
             raise ValueError("pocket constraints require at least one contact.")
         return self
@@ -1905,7 +1879,7 @@ def _resolve_refua_protein_property_api() -> (
 
     if protein_properties_cls is None or available_properties_fn is None:
         try:
-            from refua.protein import (  # noqa: PLC0415
+            from refua.protein import (
                 ProteinProperties,
                 available_protein_properties,
             )
@@ -1975,7 +1949,7 @@ def _protein_property_catalog() -> (
 
     specs_payload: dict[str, dict[str, Any]] = {}
     try:
-        from refua.protein import protein_property_specs  # noqa: PLC0415
+        from refua.protein import protein_property_specs
 
         for name, spec in protein_property_specs().items():
             specs_payload[str(name)] = {
@@ -2351,7 +2325,7 @@ def _build_complex_from_spec(
     entities: list[dict[str, Any]],
     boltz_mol_dir: Path | None,
 ) -> tuple[Complex, dict[str, str], bool, bool]:
-    from refua import Complex, DNA, Protein, RNA
+    from refua import DNA, RNA, Complex, Protein
 
     if not entities:
         raise ValueError("entities must include at least one entity spec.")
@@ -2464,9 +2438,7 @@ def _build_complex_from_spec(
                 length = entity.get("length")
                 if length is not None:
                     length = int(length)
-                cyclic = (
-                    bool(entity.get("cyclic")) if "cyclic" in entity else bool(False)
-                )
+                cyclic = bool(entity.get("cyclic")) if "cyclic" in entity else False
                 peptide_binder = _make_binder(
                     spec=spec,
                     length=length,
@@ -2780,9 +2752,7 @@ def _summarize_features(features: dict[str, Any]) -> dict[str, list[int]]:
 
     summary: dict[str, list[int]] = {}
     for key, value in features.items():
-        if torch.is_tensor(value):
-            summary[key] = list(value.shape)
-        elif isinstance(value, np.ndarray):
+        if torch.is_tensor(value) or isinstance(value, np.ndarray):
             summary[key] = list(value.shape)
     return summary
 
@@ -4517,7 +4487,7 @@ if _DATA_AVAILABLE:
         for part in parts:
             frame = pd.read_parquet(part, columns=query_columns)
             scanned_parts += 1
-            scanned_rows += int(len(frame))
+            scanned_rows += len(frame)
 
             filtered = _apply_data_query_filters(frame, query_filters)
             if filtered.empty:
@@ -5579,7 +5549,10 @@ if _ADMET_AVAILABLE:
         include_scoring: bool,
         task_ids: tuple[str, ...] | None,
     ) -> dict[str, Any]:
-        from refua.admet import AdmetScorer, admet_profile  # type: ignore[reportMissingImports]
+        from refua.admet import (  # type: ignore[reportMissingImports]
+            AdmetScorer,
+            admet_profile,
+        )
 
         if task_ids is None:
             return admet_profile(

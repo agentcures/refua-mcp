@@ -25,7 +25,7 @@ def _install_fake_refua(monkeypatch: pytest.MonkeyPatch) -> None:
             *,
             lazy: bool = True,
             sanitize: bool = True,
-        ) -> "FakeProteinProperties":
+        ) -> FakeProteinProperties:
             return cls(sequence, lazy=lazy, sanitize=sanitize)
 
         def get(self, name: str):

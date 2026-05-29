@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 
 import anyio
-from mcp.types import CompletionArgument, ResourceTemplateReference
 import pytest
+from mcp.types import CompletionArgument, ResourceTemplateReference
 
 import refua_mcp.server as server
 
