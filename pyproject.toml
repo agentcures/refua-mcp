@@ -44,9 +44,6 @@ Repository = "https://github.com/agentcures/refua-mcp"
 test = [
   "pytest>=7.0",
 ]
-dev = [
-  "pre-commit>=4.5.1",
-]
 observability = [
   "opentelemetry-api>=1.28.0",
 ]
@@ -81,8 +78,11 @@ ecosystem = [
   "refua-deploy>=0.7.2",
 ]
 
-[tool.poetry.group.dev.dependencies]
-pre-commit = ">=4.5.1"
+[dependency-groups]
+dev = [
+  "pytest>=7.0",
+  "pre-commit>=4.5.1",
+]
 
 [project.scripts]
 refua-mcp = "refua_mcp.server:main"
