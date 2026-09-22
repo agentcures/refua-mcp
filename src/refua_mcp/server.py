@@ -654,6 +654,18 @@ def _normalize_data_query_filters(filters: Mapping[str, Any] | None) -> dict[str
     return {str(key): value for key, value in filters.items()}
 
 
+def _parquet_columns_for_query(
+    columns: list[str] | None,
+    filters: Mapping[str, Any],
+) -> list[str] | None:
+    """Columns to read so filters can see fields omitted from the projection."""
+    if columns is None:
+        return None
+    if not filters:
+        return list(columns)
+    return list(dict.fromkeys([*columns, *(str(name) for name in filters)]))
+
+
 def _apply_data_query_filters(frame: Any, filters: Mapping[str, Any]) -> Any:
     if not filters:
         return frame
@@ -4484,8 +4496,9 @@ if _DATA_AVAILABLE:
         rows: list[dict[str, Any]] = []
         scanned_rows = 0
         scanned_parts = 0
+        read_columns = _parquet_columns_for_query(query_columns, query_filters)
         for part in parts:
-            frame = pd.read_parquet(part, columns=query_columns)
+            frame = pd.read_parquet(part, columns=read_columns)
             scanned_parts += 1
             scanned_rows += len(frame)
 
@@ -4496,6 +4509,12 @@ if _DATA_AVAILABLE:
                 break
             remaining = int(limit) - len(rows)
             batch = filtered.head(remaining)
+            if query_columns is not None:
+                extra_columns = [
+                    column for column in batch.columns if column not in query_columns
+                ]
+                if extra_columns:
+                    batch = batch.drop(columns=extra_columns)
             rows.extend(batch.to_dict(orient="records"))
             if len(rows) >= limit:
                 break
